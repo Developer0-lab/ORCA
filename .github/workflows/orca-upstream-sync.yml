@@ -33,9 +33,9 @@ jobs:
         run: |
           rsync -a --delete \
             --exclude='.git/' \
-            --exclude='.github/workflows/' \
-            --exclude='README.md' \
-            --exclude='ORCA-FOUNDATION.md' \
+            --exclude='/README.md' \
+            --exclude='/ORCA-FOUNDATION.md' \
+            --exclude='/.github/workflows/orca-upstream-sync.yml' \
             /tmp/orca-upstream/ ./
 
       - name: Commit upstream snapshot
