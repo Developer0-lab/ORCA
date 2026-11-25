@@ -31,7 +31,12 @@ jobs:
 
       - name: Replace upstream-owned files
         run: |
-          rsync -a --delete             --exclude='.git/'             --exclude='.github/workflows/orca-upstream-sync.yml'             --exclude='ORCA-FOUNDATION.md'             --exclude='ORCA-README.md'             /tmp/orca-upstream/ ./
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/workflows/' \
+            --exclude='README.md' \
+            --exclude='ORCA-FOUNDATION.md' \
+            /tmp/orca-upstream/ ./
 
       - name: Commit upstream snapshot
         run: |
