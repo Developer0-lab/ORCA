@@ -4,7 +4,9 @@ Autonomous XAUUSD trading terminal for MetaTrader 5.
 
 ## Project status
 
-This repository is the canonical development workspace. The first release is scoped to XAUUSD only and will be developed in shadow mode before any MT5 demo execution is enabled.
+The ORCA repository now contains the upstream `MooreSi/forex-gold` application source, imported from its `main` branch on 25 November 2026. The import commit is recorded in Git history. ORCA-specific trading changes and qualification are still in development; this repository is not yet an ORCA-validated release.
+
+The first ORCA release is scoped to XAUUSD and will be developed in shadow mode before any MT5 demo execution is enabled.
 
 ## Safety rules
 
@@ -16,12 +18,12 @@ This repository is the canonical development workspace. The first release is sco
 
 ## Development sequence
 
-1. Import and verify the audited `MooreSi/forex-gold` source snapshot.
+1. Audit the imported upstream application and establish reproducible test results.
 2. Integrate the ORCA decision coordinator with the existing Breakout, Reversal, and Trend PA engines.
 3. Add a persistent shadow-decision ledger and conflict/staleness tests.
 4. Validate strategy behaviour with historical XAUUSD data and realistic costs.
-5. Complete dashboard and MT5 demo qualification.
+5. Complete the ORCA dashboard and MT5 demo qualification.
 
 ## Important
 
-The repository is currently a clean workspace. The audited source archive and Phase 2 coordinator package are maintained separately until the full source tree is imported here. Do not treat this README-only repository as a runnable trading application.
+The upstream application is the foundation, not the finished ORCA product. Do not treat a successful source import as proof that ORCA's autonomous decision system, broker connection, or trading behaviour has been validated.
