@@ -1,0 +1,539 @@
+"""The Telegram message scan pipeline (M4 B9a).
+
+This was SimulationEngine._scan_messages: 314 lines of dedup, logic
+keywords, instant entry, SL adjustment, parse, staleness, strategy
+resolution, execution and alerting, sitting inline on the runtime where
+the only way to run it was to construct an engine. The body below is that
+code verbatim -- every branch, comment and log line -- with one mechanical
+change: the fifteen `self.X` references became fields on ScanCtx.
+
+Same idiom as the runtime's _make_close_trade_ctx: one authoritative
+binding site instead of collaborators reached for ad hoc from inside a
+god object. A relocation like this fails by dropping a collaborator on a
+branch nobody exercises, so the binding is asserted directly in
+tests/core/test_scan_messages_relocation.py rather than left to luck.
+
+One field earns an explanation. `engine_for_eval` is the engine itself,
+threaded through to channel_strategy_ai.evaluate_signal_strategy, which
+still takes an engine-shaped object. Naming it rather than hiding it
+behind `self` is the point: it is the one piece of engine coupling this
+pipeline has left, and it is now visible in a dataclass instead of
+invisible in a method body.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Optional
+
+import asyncio
+import hashlib
+import re
+import time
+from collections import OrderedDict
+
+from backend.src.services.signals.parser import SIGNAL_PREFIX
+from backend.src.utils.models import STRATEGY_LIMIT_RUNNER
+from backend.src.utils.models import STRATEGY_NAMES
+from backend.src.services.trading.ai_signal_fallback import apply_sl_adjustment as _apply_sl_adjustment_impl
+from backend.src.services.signals.scan_parse_classify import classify_and_parse as _classify_and_parse_impl
+from backend.src.services.broker import ea_templates as _ea_templates
+from backend.src.services.trading.scan_auto_execute import execute_auto_signal as _execute_auto_signal_impl
+from backend.src.services.trading.scan_auto_execute import ime_enabled_for_channel as _ime_enabled_for_channel
+from backend.src.services.trading.limit_order_signal import handle_limit_order_signal as _handle_limit_order_signal_impl
+from backend.src.services.signals.repost_supersede import supersede_earlier_pending as _supersede_earlier_pending_impl
+from backend.src.services.signals.scan_edit_reparse import handle_signal_edit as _handle_signal_edit_impl
+from backend.src.services.trading.instant_entry import process_instant_entry as _process_instant_entry_impl
+from backend.src.services.signals.scan_staleness import record_staleness_or_new as _record_staleness_or_new_impl
+from backend.src.services.signals.scan_staleness import resolve_strategy_and_skip_reason as _resolve_strategy_and_skip_reason_impl
+from backend.src.services.signals import tg_repo as _tg_repo
+from backend.src.services.signals import standby_record as _standby
+from backend.src.services.signals.standby_record import STATUS_STANDBY  # noqa: F401
+from backend.src.services.cluster import node_roles as _node_roles
+from backend.src.services.signals.parser import check_sl_adjustment_rules
+from backend.src.db import database as db_module
+from backend.src.services.signals.parser import parse_gd2_instant_entry
+from backend.src.services.signals.parser import parse_instant_entry
+from backend.src.services.telegram.keyword_triggers import should_skip_for_exclusion
+from backend.src.services.telegram.keyword_triggers import should_skip_media_or_forwarded
+from backend.src.services.telegram import alerts as telegram_alerts
+from backend.src.services.telegram.keyword_triggers import try_handle_close_all_trigger
+from backend.src.services.telegram.keyword_triggers import try_handle_risk_free_be_trigger
+from backend.src.services.telegram.keyword_triggers import (
+    apply_tp_parsing_override,
+    apply_sl_parsing_override, apply_mirror_copy,
+    parse_lexicon_direction_trigger,
+)
+
+
+log = logging.getLogger(__name__)
+
+
+# ── High-risk skip: log once, not once per scan cycle ───────────────────────
+# The skip below happens BEFORE the dedup lookup that marks a message
+# processed, so the message stays in the reader's fetch window and is
+# re-decided about once a second for as long as it is there. Unsuppressed,
+# that produced 204,359 identical lines in one day (bugs/065) -- 80% of the
+# log -- from nine messages, and buried every real fault in the file.
+#
+# Same idiom, same reasons, as scan_parse_classify's bare-direction memory
+# (bugs/015): bounded, keyed on the message BODY as well as the id so an
+# edit that is still high-risk reports itself once more, and with a reset
+# seam because module state otherwise leaks between tests.
+_HIGH_RISK_LOG_MEMORY = 512
+_high_risk_logged: "OrderedDict[tuple[str, str], None]" = OrderedDict()
+
+
+def _high_risk_key(tg_id: str, text: str) -> tuple[str, str]:
+    digest = hashlib.blake2s(text.encode("utf-8", "replace"), digest_size=8)
+    return (str(tg_id), digest.hexdigest())
+
+
+def _note_high_risk_skip(tg_id: str, text: str) -> bool:
+    """True the first time this message body is skipped, False on every rescan."""
+    key = _high_risk_key(tg_id, text)
+    if key in _high_risk_logged:
+        return False
+    _high_risk_logged[key] = None
+    while len(_high_risk_logged) > _HIGH_RISK_LOG_MEMORY:
+        _high_risk_logged.popitem(last=False)
+    return True
+
+
+def reset_high_risk_log_memory() -> None:
+    """Test seam. Module state would otherwise leak between tests."""
+    _high_risk_logged.clear()
+
+
+@dataclass
+class ScanCtx:
+    """Everything the scan pipeline reached for through `self`."""
+    bridge: Any = None
+    tg_reader: Optional[Any] = None
+    cfg: Optional[dict] = None
+    dpm_candles: Optional[Any] = None
+    # Mutable, and deliberately shared with the runtime rather than copied:
+    # the accept_tg_signals-is-OFF warning is throttled to once per five
+    # minutes ACROSS scans, so a per-call copy would warn on every cycle.
+    tg_off_warn_state: dict = field(default_factory=dict)
+    # See the module docstring -- the last engine-shaped dependency.
+    engine_for_eval: Any = None
+    # Bound runtime methods.
+    close_trade: Optional[Callable[..., Awaitable[dict]]] = None
+    try_ai_signal_fallback: Optional[Callable[..., Awaitable[Any]]] = None
+    find_and_apply_instant_followup: Optional[Callable[..., Awaitable[bool]]] = None
+    get_trading_balance: Optional[Callable[..., Awaitable[float]]] = None
+    suggest_lot_size: Optional[Callable[..., Any]] = None
+    queue_unrecognised: Optional[Callable[..., Awaitable[None]]] = None
+    is_trading_paused: Optional[Callable[[], bool]] = None
+    get_open_trades: Optional[Callable[[], list]] = None
+    check_pre_trade_filters: Optional[Callable[..., Awaitable[Any]]] = None
+    open_trade: Optional[Callable[..., Awaitable[dict]]] = None
+
+
+async def scan_messages(ctx: ScanCtx) -> list[dict]:
+    # Telegram is traded by the node that trades (docs/todo/010, owner
+    # 2026-09-29), whatever centralized_signal_gen_enabled says: that switch
+    # now covers the engines only. The other node records for display, below.
+    if ctx.tg_reader is None:
+        return []
+    msgs = ctx.tg_reader.get_buffer_messages(limit=100)
+    if not msgs:
+        return []
+
+    slot_groups = ctx.tg_reader.get_active_group_slots()
+    rs           = db_module.get_risk_settings()
+
+    if not bool(rs.get("accept_tg_signals", 1)):
+        # Dropping signals must never be silent — an accidental toggle-off
+        # cost a valid the reference channel signal on 2026-07-03 with zero log evidence.
+        # Warn (throttled to once per 5 min) whenever messages are being
+        # discarded while the switch is off.
+        now_ts = time.time()
+        if now_ts - ctx.tg_off_warn_state.get("at", 0.0) > 300:
+            ctx.tg_off_warn_state["at"] = now_ts
+            log.warning(
+                "[engine] accept_tg_signals is OFF — %d buffered Telegram "
+                "message(s) are being IGNORED (Trading tab → Signals → "
+                "'Telegram Signals' toggle)", len(msgs),
+            )
+        return []
+
+    if not await db_module.to_db_thread(_node_roles.is_active_trader_node):
+        return await db_module.to_db_thread(_standby.record, ctx.tg_reader, msgs, slot_groups, rs)
+
+    auto_execute = bool(rs.get("auto_execute_signals", 0))
+    new_signals: list[dict] = []
+
+    exclude_high_risk = bool(rs.get("exclude_high_risk", 0))
+    # One read per channel per pass, not per buffered message: this ran up to
+    # 100 times a second on the loop (bugs/030). Lives for this pass only, so
+    # a channel switched off is seen on the next one.
+    _ch_cfg_memo: dict[str, dict | None] = {}
+
+    for msg in msgs:
+        try:
+            tg_id    = str(msg.get("id") or "")
+            group_id = str(msg.get("group_id") or "")
+            text     = (msg.get("text") or "").strip()
+            if not tg_id or not text:
+                continue
+            from backend.src.utils import latency_trace as _lt_scan
+            _lt_scan.mark(tg_id, "t6_scanning")
+            if slot_groups and group_id and group_id not in slot_groups:
+                continue
+
+            if exclude_high_risk and "high risk" in text.lower():
+                if _note_high_risk_skip(tg_id, text):
+                    log.info("[engine] Skipping high-risk signal tg_id=%s", tg_id)
+                continue
+
+            slot         = slot_groups.get(group_id, 1)
+            channel_name = ctx.tg_reader.get_group_name(group_id) or f"Channel {slot}"
+
+            # Resolve channel parser config — auto-bootstrap on first sight
+            if channel_name not in _ch_cfg_memo:
+                _ch_cfg_memo[channel_name] = db_module.get_channel_parser_config(channel_name)
+            ch_cfg = _ch_cfg_memo[channel_name]
+            if ch_cfg is None:
+                _default_fmt    = 'format_ab' if slot == 1 else 'gd2'
+                _default_prefix = SIGNAL_PREFIX if _default_fmt == 'format_ab' else ''
+                _default_ime    = 1  # enabled for both format_ab and gd2
+                db_module.save_channel_parser_config(
+                    channel_name, _default_fmt, _default_prefix,
+                    bool(_default_ime), True,
+                    f'Auto-configured from slot {slot}',
+                )
+                ch_cfg = db_module.get_channel_parser_config(channel_name) or {}
+                _ch_cfg_memo[channel_name] = ch_cfg
+            parser_fmt  = ch_cfg.get('parser_format', 'auto')
+            sig_prefix  = ch_cfg.get('signal_prefix') or SIGNAL_PREFIX
+
+            if parser_fmt == 'none' or not bool(ch_cfg.get('enabled', 1)):
+                continue
+
+            # ── Logic Keywords (Parsing page) ────────────────────────────────
+            # Global, user-editable phrase lexicons -- checked ahead of
+            # everything else below since Ignore Media/Forwarded and the
+            # CLOSE ALL/RISK FREE-BE/TP HIT triggers are orthogonal to normal
+            # signal parsing (a "CLOSE ALL" message, say, would never parse as
+            # a signal anyway, but skipping it here avoids it falling through
+            # to the unrecognised-message queue). See core_logic_keyword_triggers.py.
+            _lk_skip = should_skip_media_or_forwarded(msg, rs)
+            if _lk_skip:
+                log.debug("[LogicKeywords] tg_id=%s skipped — %s", tg_id, _lk_skip)
+                continue
+            if await try_handle_close_all_trigger(
+                text, channel_name, tg_id, rs, close_trade_fn=ctx.close_trade,
+            ):
+                continue
+            if await try_handle_risk_free_be_trigger(
+                text, channel_name, tg_id, rs, bridge=ctx.bridge,
+            ):
+                continue
+
+            # Dedup — skip already-processed messages, but re-parse edited ones
+            # if the signal hasn't been executed yet (direction correction).
+            _existing = _tg_repo.get_tg_signal_meta(tg_id)
+            if _existing:
+                _ex = db_module.row_to_dict(_existing)
+                _edit_result = await _handle_signal_edit_impl(
+                    tg_id, group_id, channel_name, text, parser_fmt, _ex,
+                    ai_fallback_fn=ctx.try_ai_signal_fallback,
+                    find_and_apply_instant_followup_fn=ctx.find_and_apply_instant_followup,
+                    close_trade_fn=ctx.close_trade,
+                )
+                if _edit_result is None:
+                    continue
+                # A pending_followup signal just received its SL/TP via this
+                # edit — fall through to the normal Instant-Market-Entry /
+                # SL-adjustment / classify-and-parse pipeline below exactly
+                # like a brand-new message would (the edited raw_text now
+                # parses as a full signal on its own); _edit_result itself is
+                # deliberately unused past this point, matching the original
+                # inline code's behavior of re-deriving `parsed` from scratch
+                # rather than reusing the edit-time reparse.
+
+            # ── Instant Market Entry ────────────────────────────────────────
+            # Both trigger layouts, every channel (2026-08-27). This used to
+            # branch on parser_fmt: a gd2 channel got is_gd2_message + the GD2
+            # trigger parser, and every other channel got a bare
+            # `"XAU" in text` gate plus parse_instant_entry, which requires a
+            # literal "XAU... BUY NOW". So on a format_ab channel -- Gold
+            # Diggers VIP -- a market entry worded "Buy Gold Now", "Buy Zone
+            # Now" or "XAU USD BUY" (no NOW) matched nothing and was never
+            # executed at all, while the identical message on a gd2 channel
+            # fired. Same complaint as the 2026-07-06 GD2 outage, opposite
+            # direction.
+            #
+            # No pre-gate: each parser already gates itself (parse_instant_
+            # entry needs XAU + NOW, parse_gd2_instant_entry needs "XAU USD
+            # BUY/SELL" or "Buy/Sell Zone|Gold Now"), and the substring gate
+            # was only ever a cheap filter that could disagree with them.
+            # Both refuse a message that already carries SL/TP -- that is a
+            # full signal and goes through the parsers below.
+            # parse_lexicon_direction_trigger is last of the three: the two
+            # built-in parsers recognise a named layout, the lexicon one
+            # recognises whatever the user typed into Parsing > Logic
+            # Keywords, so a built-in match must win rather than depend on
+            # what happens to be in a box.
+            #
+            # ime_enabled_for_channel is now the single shared gate (the
+            # same function scan_auto_execute and governor.rr_filter_bypassed
+            # call) -- 2026-09-03, by owner directive, Immediate Market Entry
+            # is a single global feature, not a per-channel opt-in. The old
+            # per-channel `instant_entry_enabled` check was one of three
+            # independent copies of "global toggle AND per-channel flag",
+            # exactly the pattern 20-trading-safety.md warns against ("a
+            # route is eventually missed") -- confirmed live 2026-08-06, when
+            # GOLD DIGGERS INSTITUTIONAL was opted in on one path and still
+            # declined on the others. ch_cfg is guaranteed to exist here
+            # (auto-bootstrapped just above), so the function's remaining
+            # "is this a real Telegram channel" check always passes for this
+            # call site specifically -- it still matters for the other two
+            # callers, which reach it for non-Telegram sources.
+            if _ime_enabled_for_channel(rs, channel_name):
+                _instant = (parse_instant_entry(text)
+                            or parse_gd2_instant_entry(text)
+                            or parse_lexicon_direction_trigger(text))
+                if _instant:
+                    _instant_dir, _instant_px = _instant
+                    await _process_instant_entry_impl(msg, tg_id, group_id, channel_name, text, _instant_dir, _instant_px, rs, auto_execute, ctx.bridge, ctx.dpm_candles, ctx.cfg.get('starting_balance', 1000.0))
+                    continue
+
+            # ── SL-adjustment fast path (learned rule only — no AI call) ────
+            # Checked before any entry-signal parsing since it's an orthogonal
+            # message category (a follow-up to an EXISTING trade, e.g. "Adjust
+            # SL to 4060", not a new entry) — see signal_parser.
+            # check_sl_adjustment_rules and _apply_sl_adjustment above. A
+            # message with no matching rule yet still reaches the entry-signal
+            # gates below and, if those also fail, the AI fallback classifies
+            # it there instead (first-time cost; a rule gets built on approval
+            # so it never needs another AI call for this channel's wording).
+            _sl_adj = check_sl_adjustment_rules(text, channel_name)
+            if _sl_adj is not None:
+                # rs passed through: this loop already holds the settings, and
+                # the gate inside would otherwise re-read them per message.
+                await _apply_sl_adjustment_impl(_sl_adj, channel_name, tg_id, 'learned_rule', ctx.bridge, rs)
+                continue
+
+            # ── Logic Keywords: exclusion pre-check ──────────────────────────
+            # Gates only the new-signal-parsing path below (unlike the
+            # triggers above, which run regardless) -- see
+            # should_skip_for_exclusion's own docstring for why this doesn't
+            # also gate on symbol_tokens.
+            _lk_parse_skip = should_skip_for_exclusion(text, rs)
+            if _lk_parse_skip:
+                log.debug("[LogicKeywords] tg_id=%s skipped — %s", tg_id, _lk_parse_skip)
+                continue
+
+            # ── Channel-name-based signal parsing ────────────────────────────
+            source_label = channel_name
+            parsed = await _classify_and_parse_impl(
+                tg_id, group_id, channel_name, text, msg, parser_fmt, sig_prefix,
+                ai_fallback_fn=ctx.try_ai_signal_fallback,
+                queue_unrecognised_fn=ctx.queue_unrecognised,
+                rs=rs,
+            )
+            if parsed is None:
+                continue
+
+            # ── Logic Keywords: Enable TP/SL Parsing toggles ─────────────────
+            # OFF means "don't use this signal's own stated TP/SL levels" --
+            # strips the field(s) right after parsing so every downstream
+            # consumer (validation, strategy resolution, execution) sees
+            # exactly the same "missing field" shape it already handles for
+            # a signal that never had one, rather than a new code path.
+            _tp_sub = apply_tp_parsing_override(parsed, rs, channel_name)
+            if _tp_sub:
+                log.info("[LogicKeywords] tg_id=%s — %s", tg_id, _tp_sub)
+            # A stop is NOT optional the way a TP is, so SL Parsing OFF substitutes
+            # a configured distance rather than stripping the field. Stripping it
+            # (what this did before the 2026-08-25 merge) sent the signal on with
+            # no stop at all -- see apply_sl_parsing_override for the resolution
+            # order (channel template sl_pips, then Fallback SL Distance, then the
+            # built-in default) and for the live crash stripping caused.
+            _sl_sub = apply_sl_parsing_override(parsed, rs, channel_name)
+            if _sl_sub:
+                log.info("[LogicKeywords] tg_id=%s — %s", tg_id, _sl_sub)
+
+            # ── Parsing Settings: Reverse / Mirror Copy ──────────────────────
+            # Must run BEFORE _record_staleness_or_new_impl below, which writes
+            # `parsed` verbatim into vantage_tg_signals -- that row is what the
+            # UI, the "signal detected" Telegram alert and the audit trail all
+            # read back, so mirroring after it would leave the recorded signal
+            # facing the opposite way to the trade actually placed from it.
+            #
+            # Arrived with the 2026-08-25 merge and was never called: upstream
+            # invokes it here in engine.py, and this loop is engine.py's
+            # relocated body, so the call site did not travel with the module.
+            # The toggle (lk_enable_mirror_copy) therefore did nothing at all.
+            _mirror = apply_mirror_copy(parsed, rs)
+            if _mirror:
+                log.info("[ParsingSettings] Mirror Copy tg_id=%s — %s", tg_id, _mirror)
+
+            # Staleness guard — signals are scalps: an entry zone is only valid for
+            # minutes. Anything older than 4 minutes at processing time is recorded
+            # as historical and never executed. The previous 2-hour window let a
+            # 22-minute-old the reference channel signal execute at market after a downtime
+            # (2026-07-03: toggle-off gap → backfilled signal filled 22min late at
+            # a worse price → straight to SL). 4 min covers Telegram delivery
+            # latency plus one scan cycle, nothing more.
+            _is_fresh = await _record_staleness_or_new_impl(
+                tg_id, group_id, channel_name, msg, parsed, source_label, rs,
+            )
+            if not _is_fresh:
+                continue
+
+            from backend.src.utils import latency_trace as _lt_dec
+            _lt_dec.mark(tg_id, "t7_decided")
+
+            if parsed.get("_ai_extracted"):
+                # The deterministic parser missed this message (format drift) —
+                # log it for the review tab; the Telegram notification is
+                # merged into the fmt_signal() call below (single message
+                # instead of two separate ones hitting the user's phone).
+                log.info(
+                    "[AI-Fallback] tg_id=%s executing an AI-recovered signal "
+                    "(confidence=%.2f)", tg_id, parsed.get("_ai_confidence", 0),
+                )
+
+            executed             = False
+            exec_lot             = None
+            exec_price           = None
+            trade_result         = None
+            _gap_note            = ""  # only set below if gap-adjusted execution fires
+
+            # Channel override > auto-Claude rec > global Active Strategy,
+            # plus the per-signal "High Risk" override, session gate, and
+            # trading-paused check.
+            _strat_result = await _resolve_strategy_and_skip_reason_impl(
+                rs, channel_name, text, parsed, auto_execute,
+                ctx.cfg, ctx.engine_for_eval,
+                is_trading_paused_fn=lambda: db_module.to_db_thread(ctx.is_trading_paused),
+            )
+            strategy             = _strat_result["strategy"]
+            strategy_name        = _strat_result["strategy_name"]
+            skip_reason          = _strat_result["skip_reason"]
+            _sess_ok             = _strat_result["sess_ok"]
+            _per_signal_skip     = _strat_result["per_signal_skip"]
+            _per_signal_skip_rsn = _strat_result["per_signal_skip_reason"]
+
+            if auto_execute:
+                # Limit Runner: a genuine EA pending order, not a market-fill
+                # signal — parse_limit_order_signal's `tp_open` marker (always
+                # present, True or False, only on its own return dicts) means
+                # this signal would default to Limit Runner regardless of
+                # whatever channel-override/active-strategy _resolve_strategy_
+                # and_skip_reason_impl above just computed, since the strategy
+                # here is format-triggered, not channel-configured — EXCEPT
+                # when the channel has a GRID EA Template assigned (Trading >
+                # Strategy > Channel Strategy > "Template: <name>"). Fixed
+                # 2026-07-24 — a template-assigned channel's "[LIMITS]"-
+                # formatted signals were silently always executing as Limit
+                # Runner instead, so a configured Grid template never actually
+                # ran for them.
+                #
+                # Narrowed from "any template" to "a grid template"
+                # (limit-orders/010, owner 2026-09-10). The 2026-07-24 fix was
+                # right about grid and wrong about single, and the two cases
+                # are opposites: a grid template IS a pending-order strategy
+                # (it stages resting legs across the zone, see
+                # scan_auto_execute.py's _tpl_grid branch), while a single
+                # template is a market-fill strategy with NO resting path
+                # behind it. So a "[LIMITS]" message on a single template lost
+                # its limit wording, fell through to the market branch, and
+                # was gap-fired up to MAX_GAP_FIRE_PTS past its own zone.
+                # Confirmed live 2026-09-10: GOLD DIGGERS INSTITUTIONAL,
+                # "BUY LIMITS GOLD @ 4415/4410 AREA", filled at market 4428.76
+                # with SL and all three TPs shifted +13.7 to match.
+                #
+                # **The keyword decides the entry mechanic; the template
+                # decides the management.** A single template still governs
+                # the fill completely — see limit_order_signal._resolve_
+                # management, which now returns it — so nothing about the
+                # template's authority is lost, only its claim over WHEN the
+                # trade is entered.
+                if parsed.get("tp_open") is not None and not _ea_templates.is_grid_template(strategy):
+                    strategy      = STRATEGY_LIMIT_RUNNER
+                    strategy_name = STRATEGY_NAMES[STRATEGY_LIMIT_RUNNER]
+                    _exec_result = await _handle_limit_order_signal_impl(
+                        parsed, tg_id, channel_name, source_label, rs,
+                        _sess_ok, _per_signal_skip, _per_signal_skip_rsn, skip_reason,
+                        get_trading_balance_fn=ctx.get_trading_balance,
+                        suggest_lot_size_fn=ctx.suggest_lot_size,
+                        bridge=ctx.bridge,
+                    )
+                    executed     = False
+                    exec_lot     = None
+                    exec_price   = None
+                    trade_result = None
+                    skip_reason  = _exec_result["skip_reason"]
+                else:
+                    _exec_result = await _execute_auto_signal_impl(
+                        parsed, tg_id, channel_name, source_label, strategy, rs,
+                        _sess_ok, _per_signal_skip, _per_signal_skip_rsn, skip_reason,
+                        ctx.bridge,
+                        get_open_trades_fn=ctx.get_open_trades,
+                        find_and_apply_instant_followup_fn=ctx.find_and_apply_instant_followup,
+                        check_pre_trade_filters_fn=ctx.check_pre_trade_filters,
+                        suggest_lot_size_fn=ctx.suggest_lot_size,
+                        get_trading_balance_fn=ctx.get_trading_balance,
+                        open_trade_fn=ctx.open_trade,
+                    )
+                    executed     = _exec_result["executed"]
+                    exec_lot     = _exec_result["exec_lot"]
+                    exec_price   = _exec_result["exec_price"]
+                    trade_result = _exec_result["trade_result"]
+                    skip_reason  = _exec_result["skip_reason"]
+                    _gap_note    = _exec_result["gap_note"]
+                    if executed and trade_result:
+                        _lt_dec.mark(tg_id, "t8_ordered")
+                    if _exec_result.get("followup_matched") or _exec_result.get("deferred_stood_down"):
+                        new_signals.append(parsed | {"tg_message_id": tg_id, "auto_executed": executed,
+                                                     "source_label": source_label})
+                        continue
+
+            # A correction re-posted within the window replaces the queued
+            # signal it corrects (owner, 2026-10-02). Only once this post has
+            # itself become a signal; a failure here must not lose the post.
+            try:
+                await _supersede_earlier_pending_impl(
+                    tg_id, source_label, parsed["direction"].upper())
+            except Exception as _sup_exc:
+                log.warning("[%s] tg_id=%s repost supersede failed: %s",
+                            source_label, tg_id, _sup_exc)
+
+            # Forwarded trade (centralized signal generation): the VPS actually
+            # placed it — trade_id/mt5_ticket belong to its DB, not this node's
+            # — and its own _handle_signal_order already schedules the correct
+            # "Node: Remote" notification via _background_open_commentary. This
+            # node sending its own fmt_signal alert here as well would always
+            # read "Node: Local" (_node_label() reflects this machine, not
+            # which one executed the trade) — a duplicate, misleading alert
+            # claiming local execution for a trade the VPS handled.
+            if not (trade_result and trade_result.get("executed_remotely")):
+                _alert_strategy = (
+                    f"{strategy_name} | {_gap_note}" if _gap_note else strategy_name
+                )
+                alert = telegram_alerts.fmt_signal(
+                    parsed, channel_name, executed,
+                    exec_lot, exec_price, skip_reason, _alert_strategy,
+                    ai_confidence=parsed.get("_ai_confidence") if parsed.get("_ai_extracted") else None,
+                    ai_reasoning=parsed.get("_ai_reasoning", "") if parsed.get("_ai_extracted") else "",
+                )
+                asyncio.create_task(telegram_alerts.send_message(alert, event_type="tg_signal_detected"))
+            new_signals.append(parsed | {"tg_message_id": tg_id, "auto_executed": executed,
+                                         "source_label": source_label})
+
+        except Exception as _msg_exc:
+            # One malformed message must not abandon the whole scan pass.
+            # Ported from upstream engine.py by the 2026-08-25 merge: this
+            # branch forked before the guard existed, so any error here
+            # propagated out of scan_messages and every later message in
+            # the buffer went unparsed.
+            log.exception("Signal scan failed for tg_id=%s (channel=%s) — "
+                          "skipping this message, continuing the batch: %s",
+                          msg.get("id"), msg.get("group_id"), _msg_exc)
+            continue
+    return new_signals

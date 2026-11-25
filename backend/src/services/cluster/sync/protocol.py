@@ -1,0 +1,255 @@
+"""
+Local/Remote node sync protocol — WebSocket messages between the Mac (client)
+and the VPS (server) for the dual-instance feature.
+
+Deliberately separate from backend.src.services.cluster.remote, which is a hub-and-spoke
+licence/admin/update-distribution protocol for many customer installs
+connecting to a central server. This is a 1:1 peer link between two
+instances of the same person's own app: the VPS (fixed IP, always-on,
+default active trader) and the Mac (opt-in takeover).
+
+All JSON messages follow: {"type": MSG_TYPE, ...extra fields}
+Binary frames are used only for the model-snapshot transfer.
+"""
+
+# ── Handshake ────────────────────────────────────────────────────────────────
+MSG_HELLO           = "hello"            # Mac -> VPS: token, first message after connect
+MSG_WELCOME          = "welcome"          # VPS -> Mac: accepted, sends current settings + status
+MSG_REJECT           = "reject"           # VPS -> Mac: bad token
+
+# ── Heartbeat / status ───────────────────────────────────────────────────────
+MSG_STATUS_HEARTBEAT = "status_heartbeat" # VPS -> Mac: balance, equity, open positions, engine states
+MSG_PING              = "ping"
+MSG_PONG              = "pong"
+
+# Full signal-generator stats (win rates, performance breakdowns, ML learning
+# panels) for the Breakout and Reversal Engines — sent far less often than
+# the 3s status heartbeat since this data only changes when a signal closes
+# or a periodic ML retrain happens. Deliberately excludes cycle logs (raw
+# per-cycle diagnostic dumps, not a "progress" metric).
+MSG_SIGNAL_GEN_STATS = "signal_gen_stats"   # VPS -> Mac: {"breakout": {...}, "reversal_engine": {...}}
+
+# ── Settings sync (VPS is authoritative) ─────────────────────────────────────
+MSG_SETTINGS_PROPOSE = "settings_propose" # Mac -> VPS: "please apply this change"
+MSG_SETTINGS_STATE   = "settings_state"   # VPS -> Mac: full confirmed settings snapshot
+MSG_SETTINGS_REJECTED = "settings_rejected"  # VPS -> Mac: propose failed, with reason
+
+# AI provider config (config.yaml, not vantage_risk_settings — a completely
+# separate storage layer, so it needs its own sync path rather than joining
+# MSG_SETTINGS_PROPOSE above). Deliberately NOT bundled with the credential-
+# free settings sync: this one carries the DeepSeek API key too, an explicit
+# user opt-in (2026-07-08) rather than the default "never sync credentials"
+# stance the settings sync above was built with. One-directional (Mac -> VPS
+# only) since the Mac's Settings > AI page is where this actually gets
+# edited; fire-and-forget, no reject/ack — there's no legitimate rejection
+# case, just plain values being mirrored.
+MSG_AI_CONFIG_SYNC = "ai_config_sync"  # Mac -> VPS: mirror ai_provider/model/deepseek_api_key
+
+# Per-channel Telegram strategy overrides (channel_performance table) — same
+# propose/confirm pattern as the settings messages above, but keyed by
+# channel rather than being one flat dict, so it gets its own message pair.
+MSG_CHANNEL_STRATEGY_PROPOSE = "channel_strategy_propose"  # Mac -> VPS
+MSG_CHANNEL_STRATEGY_STATE   = "channel_strategy_state"    # VPS -> Mac: full confirmed snapshot
+
+# Trading Schedule (app_config "trading_schedule"/"trading_schedule_enabled",
+# not vantage_risk_settings — a separate storage layer like AI config above,
+# so it needs its own pair rather than joining MSG_SETTINGS_PROPOSE). One
+# combined snapshot ({"enabled": bool, "schedule": {...}}) per message, same
+# shape as _channel_strategy_snapshot's single-dict bundle, since the whole
+# 7-day/3-window config is edited and saved as one atomic unit in the UI —
+# no per-key filtering/rejection case exists here, so no REJECTED variant.
+MSG_TRADING_SCHEDULE_PROPOSE = "trading_schedule_propose"  # Mac -> VPS
+MSG_TRADING_SCHEDULE_STATE   = "trading_schedule_state"    # VPS -> Mac: full confirmed snapshot
+
+# Strategy Parameters (app_config "strategy_params_<strategy>" per fixed-
+# parameter strategy -- Conservative/Scalp Runner/Reversal Runner/Adaptive
+# Runner/Adaptive Runner 2's live SL/TP values, core_strategy_params.py) --
+# same one-combined-snapshot-per-message shape as Trading Schedule above:
+# all 5 strategies' values are proposed/confirmed together, not as
+# separate per-strategy messages, so two near-simultaneous edits to
+# different strategies can't race each other. The named-template library
+# (strategy_param_templates table) is NOT synced -- each node keeps its
+# own saved presets.
+MSG_STRATEGY_PARAMS_PROPOSE = "strategy_params_propose"  # Mac -> VPS
+MSG_STRATEGY_PARAMS_STATE   = "strategy_params_state"    # VPS -> Mac: full confirmed snapshot
+
+# Expert Tunables (app_config "expert_params", risk/expert_params.py) -- same
+# full-snapshot shape as Strategy Parameters. Added 2026-09-25: the service
+# had been calling a propose method no client ever had since 2026-08-03.
+MSG_EXPERT_PARAMS_PROPOSE = "expert_params_propose"  # Mac -> VPS
+MSG_EXPERT_PARAMS_STATE   = "expert_params_state"    # VPS -> Mac: full confirmed snapshot
+
+# MT5 accounts and the demo/live choice (owner, 2026-09-26): the Mac's
+# credentials for each account, and which one it is on, so the VPS trades the
+# same account. Credentials, so NOT part of the settings sync above, which
+# never carries them. Mac -> VPS only; the VPS answers with what it is on.
+MSG_MT5_ACCOUNTS     = "mt5_accounts"      # Mac -> VPS: {"accounts": {...}, "environment"}
+MSG_MT5_ACCOUNTS_ACK = "mt5_accounts_ack"  # VPS -> Mac: {"environment", "switched", "error"}
+
+# EA templates (owner, 2026-09-29): the Mac's whole template library, sent on
+# connect, on any change and every 10 min (sync/_ea_templates_sync.py). The VPS
+# writes what differs. Mac -> VPS only, no ack; an older VPS ignores it.
+MSG_EA_TEMPLATES = "ea_templates"  # Mac -> VPS: {"templates": [{name, ...fields}]}
+
+# Telegram channel set-up (owner, 2026-09-29): the slot channels, per-channel
+# parser config and Logic Keywords lexicons, sent like the EA templates
+# (sync/_channel_setup_sync.py). The VPS writes what differs and answers.
+MSG_CHANNEL_SETUP     = "channel_setup"      # Mac -> VPS: {"parser_configs", "lexicons", "slots", "channel_pauses", "news_blackout"}
+MSG_CHANNEL_SETUP_ACK = "channel_setup_ack"  # VPS -> Mac: {"parser_configs","lexicons","slots": written, "errors"} (+ "channel_pauses", "news_blackout" when sent)
+
+# ── Trading mutual exclusion (Option A: block switch-back on open local positions) ──
+MSG_STAND_DOWN        = "stand_down"        # Mac -> VPS: taking over, stop opening new trades
+MSG_STAND_DOWN_ACK    = "stand_down_ack"    # VPS -> Mac: stood down, here is my open-position summary
+MSG_RESUME            = "resume"            # Mac -> VPS: handing control back
+MSG_RESUME_ACK        = "resume_ack"        # VPS -> Mac: resumed accepting new trades
+
+# ── Remote engine control (Signal Generator panels, Remote mode) ────────────
+# When this node is in Remote mode, the Start/Stop/Run Now buttons on the
+# Breakout/Reversal Engine panels must act on the VPS's own engine instance,
+# not this node's own (stood-down) local one — otherwise "Start Engine"
+# silently does nothing useful while looking like it worked.
+MSG_ENGINE_CONTROL     = "engine_control"      # Mac -> VPS: {"engine": "reversal_engine", "action": "start"/"stop"/"run_now"}
+MSG_ENGINE_CONTROL_ACK = "engine_control_ack"  # VPS -> Mac: {"engine", "action", "is_running", "error"?}
+
+# The engine registry and the Signal Generator tab call Reversal "reversal";
+# the wire, the VPS's `_sub_engines` table, the heartbeat and the stood-down
+# lists have always called it "reversal_engine". Forwarding the registry name
+# unchanged got every Remote-mode Start/Stop for Reversal refused as
+# "unknown engine: reversal" (2026-09-28). The wire key is not renamed: a VPS
+# on an older build knows only "reversal_engine". A name missing from this
+# table goes out as it is, and a peer that does not know it refuses it.
+ENGINE_WIRE_NAMES = {"reversal": "reversal_engine"}
+
+
+def engine_wire_name(name: str) -> str:
+    """The name the peer's `_sub_engines` knows this engine by."""
+    return ENGINE_WIRE_NAMES.get(name, name)
+
+# Settings > Remote Node > Restart VPS (owner, 2026-09-26): restart the VPS
+# without logging in to it. The VPS restarts as /restartapp does
+# (sync/_restart_sync.py). An older VPS has no handler and never answers.
+MSG_RESTART_NODE     = "restart_node"      # Mac -> VPS
+MSG_RESTART_NODE_ACK = "restart_node_ack"  # VPS -> Mac: {"ok", "note"}
+
+# Settings > Remote Node > Write off (owner, 2026-09-28): the VPS writes off
+# placeholders its broker has no record of (sync/_writeoff_sync.py). An older
+# VPS has no handler and never answers.
+MSG_WRITE_OFF_UNCONFIRMED     = "write_off_unconfirmed"      # Mac -> VPS
+MSG_WRITE_OFF_UNCONFIRMED_ACK = "write_off_unconfirmed_ack"  # VPS -> Mac: {"written_off", "kept", "error"}
+
+# Settings > Remote Node > Upgrade VPS (owner, 2026-09-27): the VPS updates as
+# its own Settings > Update does (sync/_update_sync.py). It acks at once; a
+# failure before the restart follows as MSG_UPDATE_NODE_RESULT.
+MSG_UPDATE_NODE        = "update_node"         # Mac -> VPS
+MSG_UPDATE_NODE_ACK    = "update_node_ack"     # VPS -> Mac: {"ok", "note"}
+MSG_UPDATE_NODE_RESULT = "update_node_result"  # VPS -> Mac: {"ok": False, "note"}
+
+# Same problem as engine control above, for the Trading tab's manual "Market
+# Order" button — clicking it while stood down previously just failed with
+# "Trading stood down", even though the user explicitly asked for a trade
+# right now. Routes the request to the VPS's own open_manual_market_order().
+MSG_MARKET_ORDER     = "market_order"      # Mac -> VPS: {"direction","stop_loss","lot_size","strategy"}
+MSG_MARKET_ORDER_ACK = "market_order_ack"  # VPS -> Mac: {"result": {...}} or {"error": "..."}
+
+# Close, the other half (owner, 2026-09-29): a position the VPS opened is closed
+# from the Mac by asking the VPS to run its own close_trade against its own
+# record (sync/_remote_close_sync.py). req_id pairs each ack with its request.
+MSG_CLOSE_TRADE     = "close_trade"      # Mac -> VPS: {"req_id","trade_id","reason"}
+MSG_CLOSE_TRADE_ACK = "close_trade_ack"  # VPS -> Mac: {"req_id","result"} or {"req_id","error"}
+
+# Resume trading on the VPS from the Mac's header badge (owner, 2026-09-29):
+# the VPS runs its own trading_status.resume_all() (sync/_remote_resume_sync.py).
+# Not MSG_RESUME, which hands the trader role back. An older VPS never answers.
+MSG_RESUME_TRADING     = "resume_trading"      # Mac -> VPS: {"req_id"}
+MSG_RESUME_TRADING_ACK = "resume_trading_ack"  # VPS -> Mac: {"req_id","result"} or {"req_id","error"}
+
+# Read-only reports for the Dashboard from the node that trades (owner,
+# 2026-10-02): Fill cost and GEX live in the trader's own database, so the
+# Mac asks the VPS for the same report instead of reading its own
+# (sync/_peer_report_sync.py). `name` is looked up in a fixed table on the VPS.
+MSG_PEER_REPORT     = "peer_report"      # Mac -> VPS: {"req_id","name","args"}
+MSG_PEER_REPORT_ACK = "peer_report_ack"  # VPS -> Mac: {"req_id","result"} or {"req_id","error"}
+
+# Merging ML training rows (docs/todo/026, sync/_ml_merge_sync.py). The Mac
+# pulls the VPS's rows with peer report "ml_history" and pushes its own with
+# MSG_ML_HISTORY_PUSH, in frames under LEDGER_PUSH_CHUNK_BYTES; then it asks
+# the VPS to run its benefit check. An older VPS never answers.
+MSG_ML_HISTORY_PUSH   = "ml_history_push"    # Mac -> VPS: {"req_id","kind","origin_node","rows"}
+MSG_ML_MERGE_EVALUATE = "ml_merge_evaluate"  # Mac -> VPS: {"req_id"}
+MSG_ML_MERGE_ACK      = "ml_merge_ack"       # VPS -> Mac: {"req_id", "inserted"|"result"} or {"req_id","error"}
+
+# Centralized signal generation (Settings > Remote Node > "Generate signals on
+# this node only") — a fully-resolved trade decision from one of the Mac's own
+# generators (Breakout/TestSignal/REopy/GD2-GD-VIP), forwarded to the VPS for
+# execution because the VPS has stopped analyzing anything itself under this
+# mode (see core.database.should_generate_signals_here). Unlike MSG_MARKET_ORDER
+# (a raw manual order), this carries open_trade()'s full parameter set — the
+# Mac has already resolved risk sizing, session gates, and SL/TP logic before
+# this is sent, so the VPS calls open_trade() directly, not open_trade_from_signal.
+MSG_SIGNAL_ORDER     = "signal_order"      # Mac -> VPS: full open_trade() payload from a generator
+MSG_SIGNAL_ORDER_ACK = "signal_order_ack"  # VPS -> Mac: {"result": {...}} or {"error": "..."}
+
+# Instant Market Entry follow-up — when centralized_signal_gen_enabled and the
+# VPS is the active trader, an IME trade opened via a forwarded MSG_SIGNAL_ORDER
+# only exists in the VPS's own vantage_simulated_trades, never the Mac's (see
+# open_trade()'s forwarding branch). The Mac's own "is there an open instant
+# trade to apply this follow-up to" query was always querying its own (empty)
+# table and never finding a match, so every IME follow-up fell through to
+# opening a second, independent trade instead of updating the first — the VPS
+# actually placed two real MT5 orders for one signal. This message asks the
+# VPS to resolve and apply the follow-up against its own authoritative table.
+MSG_SIGNAL_FOLLOWUP     = "signal_followup"      # Mac -> VPS: {"channel_name","direction","tg_id","updates":{...}}
+MSG_SIGNAL_FOLLOWUP_ACK = "signal_followup_ack"  # VPS -> Mac: {"matched": bool, "error"?: "..."}
+
+# ── Consolidated trade ledger ────────────────────────────────────────────────
+MSG_TRADE_CLOSED      = "trade_closed"      # either side -> other: a trade closed, append to ledger
+MSG_LEDGER_PULL        = "ledger_pull"       # Mac -> VPS: "send me your full ledger" (periodic refresh)
+MSG_LEDGER_PUSH        = "ledger_push"       # VPS -> Mac: full ledger snapshot
+
+# ── Learned parser rules (Telegram > Reader Logic > AI tab) ─────────────────
+# Each node runs its own Telethon session and parses every message against its
+# own local channel_learned_rules — so without this, approving an AI-recovered
+# signal on one node only taught that node the new format; the other kept
+# paying for an AI fallback call (and needing its own separate approval) for
+# every future message of the same shape.
+MSG_LEARNED_RULE_SYNC = "learned_rule_sync"  # either side -> other: mirror a newly-approved parser rule
+
+# ── AI-recovered signal review queue (Telegram > Reader Logic > AI tab) ──────
+# MSG_LEARNED_RULE_SYNC above only mirrors the END RESULT of a review (the
+# generated parser rule). The review QUEUE ITSELF — ai_recovered_signals —
+# was still node-local: only the active-trader node populates new entries
+# (SimulationEngine._is_active_trader_node gates the paid AI call), so the
+# passive node's queue always looked empty, and anything created before a
+# failover became invisible/unreachable from whichever node is active now.
+# One shared source of truth, keyed by tg_message_id (UNIQUE in the table):
+MSG_AI_RECOVERED_SIGNAL_SYNC = "ai_recovered_signal_sync"  # either side -> other: mirror created/approved/rule_result/discarded
+MSG_AI_RECOVERED_PULL = "ai_recovered_pull"  # Mac -> VPS: "send me your full unresolved queue" (periodic refresh)
+MSG_AI_RECOVERED_PUSH = "ai_recovered_push"  # VPS -> Mac: full unresolved-queue snapshot
+
+# ── Model snapshot transfer (manual, on-demand only — never automatic) ───────
+MSG_MODEL_SNAPSHOT_REQUEST = "model_snapshot_request"  # requester -> other: "send me your models"
+MSG_MODEL_SNAPSHOT_UPLOAD  = "model_snapshot_upload"   # uploader -> other: "here are my models, unprompted"
+MSG_MODEL_SNAPSHOT_BEGIN   = "model_snapshot_begin"    # sender -> receiver: manifest of files to follow
+MSG_MODEL_SNAPSHOT_END     = "model_snapshot_end"      # sender -> receiver: transfer complete
+
+# Connection states surfaced to the UI (not wire messages — used by client.py)
+# websockets closes a link with 1009 on a frame over 1 MiB. The consolidated
+# ledger passed that on 2026-10-18 and the Mac reconnected forever. Frames are
+# kept well under the default by the sender (LEDGER_PUSH_CHUNK_BYTES) and the
+# client accepts more than the default so an older VPS that still sends the
+# whole ledger in one frame is not refused.
+MAX_FRAME_BYTES = 32 * 1024 * 1024
+LEDGER_PUSH_CHUNK_BYTES = 256 * 1024
+
+CONN_DISCONNECTED = "disconnected"
+CONN_CONNECTING   = "connecting"
+CONN_CONNECTED    = "connected"
+CONN_REJECTED     = "rejected"
+
+# active_trader values (stored in app_config on both sides)
+TRADER_LOCAL      = "local"
+TRADER_REMOTE_VPS = "remote_vps"
+
+
+def make(type_: str, **kwargs) -> dict:
+    return {"type": type_, **kwargs}

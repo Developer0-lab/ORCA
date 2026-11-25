@@ -1,0 +1,738 @@
+"""
+App lifecycle — engine/bridge/Telegram/sync startup and shutdown.
+
+Extracted out of frontend/app.py so this logic can be called from two
+different entry points: the normal NiceGUI-hosted app (ui/app.py's
+@app.on_startup/@app.on_shutdown wrap the functions below) and the headless
+entry point (run_headless.py), which never imports NiceGUI at all. Keeping
+exactly one implementation here means a fix or a new sub-engine wired in here
+automatically applies to both modes — nothing to remember to port twice.
+
+Nothing in this module references nicegui.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+from pathlib import Path
+from typing import Optional
+
+import backend.src.config as cfg_module
+from backend.src.db import database as db_module
+from backend.src.runtime import TradingRuntime
+from backend.src.services.telegram.reader import TelegramReader
+
+import backend.src.services.breakout_signal.breakout_signal_service as _breakout_engine_module
+import backend.src.services.reversal_engine.reversal_engine_service as _re_engine_module
+import backend.src.services.trend_pa.service as _tpa_engine_module
+import backend.src.services.cluster.remote.client as _remote_client
+import backend.src.services.cluster.remote.server as _remote_server
+from backend.src.services.cluster.remote.auth import password_is_set
+from backend.src.config.licence.issuer import (
+    is_licence_issuer_machine as _is_licence_issuer_machine,
+)
+
+log = logging.getLogger(__name__)
+
+
+def _make_tg_reader(config: dict):
+    """Composition-root choice: the Telethon reader normally, the scripted
+    FakeTelegramReader in debug mode (offline — see local-debug-mode 030).
+    Services stay swap-unaware; only this entry point decides."""
+    if config.get("debug_mode"):
+        from backend.src.services.telegram.fake_reader import FakeTelegramReader
+        scenario = _load_debug_scenario()
+        return FakeTelegramReader(config, scenario=scenario)
+    return TelegramReader(config)
+
+
+def _load_debug_scenario() -> Optional[dict]:
+    """The default debug scenario (tools/debug_scenarios/tp1-hit.json), or
+    None for the seeded synthetic stream if the file is missing/bad."""
+    import json
+    path = Path(__file__).parent.parent.parent / "tools" / "debug_scenarios" / "tp1-hit.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.warning("[debug] scenario file %s unavailable (%s) — synthetic stream", path, exc)
+        return None
+
+
+# ── Admin panel — loaded from KeyGen (not shipped with FOREX) ─────────────────
+# The admin UI lives in the KeyGen directory alongside FOREX on the admin's
+# machine. Remote users don't have that directory, so the button never appears
+# unless the server has granted them remote admin status (IOKit UUID match).
+# Lives here (not ui/app.py) so both the NiceGUI and headless entry points
+# see the same ADMIN_AVAILABLE value without duplicating the KeyGen lookup —
+# ui/app.py imports admin_open_fn for its button's on_click handler.
+
+def _import_with_timeout(module_name: str, timeout: float = 20.0):
+    """Import `module_name` on a worker thread, giving up after `timeout`.
+
+    These KeyGen modules run real work at import time — forex_admin.py opens
+    the licence registry SQLite file at module level — and that work can block
+    forever rather than fail. Confirmed live 2026-08-07: iCloud Drive had
+    evicted ~/Documents/KeyGen/licences.db (file flagged "dataless") and could
+    no longer download it back, so sqlite3.connect() never returned. The app
+    logged "Starting FOREX Trader on http://localhost:8888", hung inside this
+    module's import, and never reached ui.run() — it never bound the port, so
+    it looked like a silent failure to start, with nothing in the log and no
+    traceback. Three processes ended up wedged on the same open().
+
+    The admin console is optional; the trading app must start without it. A
+    plain import cannot be interrupted, so run it on a daemon thread and walk
+    away if it stalls — the thread stays stuck, but the process exits normally
+    and the app carries on with the admin button hidden.
+    """
+    import importlib
+    import threading
+
+    outcome: dict = {}
+
+    def _work():
+        try:
+            outcome["module"] = importlib.import_module(module_name)
+        except BaseException as exc:      # noqa: BLE001 — reported, not swallowed
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=_work, daemon=True, name=f"import-{module_name}")
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        log.error(
+            "[Admin] Importing %s blocked for over %.0fs — continuing without the "
+            "admin console. This usually means a file it opens at import time is "
+            "unreadable rather than missing (an iCloud-evicted 'dataless' file, a "
+            "stalled network mount). Check: ls -lO ~/Documents/KeyGen",
+            module_name, timeout,
+        )
+        return None
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("module")
+
+
+def _is_somebody_elses_client() -> bool:
+    """Has another machine's admin server welcomed this one as a client?
+
+    The marker is written by remote/client.py on MSG_WELCOME, and only on a
+    machine with no admin password of its own -- see its comment for why the
+    admin Mac dialling its own server must not count.
+
+    Presence of a KeyGen folder is a filesystem fact, not an authorisation:
+    an iCloud-synced ~/Documents or a copied app folder puts one on a client
+    machine, and until 2026-09-06 that alone opened the FULL local admin
+    console there. A client's route to the console is the console's own Grant
+    Admin button (_find_remote_admin_open_fn), and nothing else.
+    """
+    from backend.src.config import USER_DATA_DIR
+    try:
+        return (Path(USER_DATA_DIR) / "remote" / "is_remote_client").exists()
+    except Exception:            # unreadable data dir -- default to no console
+        return True
+
+
+def _admin_checkout_candidates(forex_root: Path) -> list:
+    """Where the admin console may live, in priority order.
+
+    `~/forex-admin` is the tracked git checkout (MooreSi/forex-admin) and
+    leads deliberately: it is the only one with history, tests and CI, and it
+    is the one both this app and the React app are developed against.
+
+    The two `KeyGen` entries are the arrangement that predates it -- untracked
+    copies with the private signing key inline in the source. They are kept so
+    a machine that has not moved over still works, and they are LAST because
+    `~/Documents` is iCloud-synced: an evicted `licences.db` there is what
+    hung this app's startup on 2026-08-07 (see `_import_with_timeout`).
+
+    Retiring them is a decision queued in the console repo at
+    docs/simon-handover/002-retire-the-legacy-keygen-paths.md. Until then the
+    order is the whole guarantee that the tracked copy is the one that runs --
+    and note that whichever wins goes onto sys.path at position 0, so a
+    fallback winning also changes which `database.py` and `licence_signing.py`
+    anything else resolves.
+    """
+    return [
+        Path.home() / "forex-admin",                 # tracked checkout — wins
+        forex_root.parent / "KeyGen",                # legacy sibling
+        Path.home() / "Documents" / "KeyGen",        # legacy, iCloud-synced
+    ]
+
+
+def _find_admin_open_fn():
+    """Look for KeyGen/forex_admin.py next to the FOREX directory.
+    Adds KeyGen to sys.path if found and returns open_admin_dialog, else None.
+    Refused outright on any machine that is not the licence issuer."""
+    if _is_somebody_elses_client():
+        log.info("[Admin] This machine is a remote client — the local KeyGen "
+                 "console is not offered here; an admin grant is (Grant Admin "
+                 "on the admin console)")
+        return None
+    # The hardware pin, not the folder (2026-09-12). A KeyGen folder on a
+    # client Mac is an iCloud artefact; this is also what keeps that machine
+    # on the client side of startup()'s server-or-client choice, so it keeps
+    # reporting to the console instead of becoming a second one.
+    if not _is_licence_issuer_machine():
+        log.info("[Admin] Not the licence-issuer machine — the local KeyGen "
+                 "console and the admin server are not offered here; this "
+                 "install runs as a client (see licence/issuer.py)")
+        return None
+    forex_root = Path(__file__).parent.parent.parent  # forex_trader/core/app_lifecycle.py → FOREX/
+    candidates = _admin_checkout_candidates(forex_root)
+    for kg_path in candidates:
+        if (kg_path / "forex_admin.py").exists():
+            if str(kg_path) not in sys.path:
+                sys.path.insert(0, str(kg_path))
+            try:
+                _fa = _import_with_timeout("forex_admin")
+                if _fa is None:
+                    return None
+                log.info("[Admin] Loaded admin module from %s", kg_path)
+                return _fa.open_admin_dialog
+            except Exception as exc:
+                log.warning("[Admin] Found forex_admin.py at %s but failed to import: %s",
+                            kg_path, exc)
+    log.debug("[Admin] KeyGen/forex_admin.py not found — admin button hidden")
+    return None
+
+
+def _find_remote_admin_open_fn():
+    """Return open_dialog from KeyGen/admin_panel.py if this machine is a granted remote admin.
+
+    The flag file is written by remote/client.py when the server confirms
+    is_remote_admin=True in MSG_WELCOME. It persists across restarts so the
+    button appears immediately on subsequent page loads without waiting for the
+    server connection to re-establish.
+
+    admin_panel.py lives in KeyGen/ (never shipped with the FOREX app) alongside
+    forex_admin.py and admin_client.py."""
+    from backend.src.config import USER_DATA_DIR
+    flag = Path(USER_DATA_DIR) / "remote" / "is_remote_admin"
+    if not flag.exists():
+        return None
+    forex_root = Path(__file__).parent.parent.parent
+    candidates = _admin_checkout_candidates(forex_root)
+    for kg_path in candidates:
+        if (kg_path / "admin_panel.py").exists():
+            if str(kg_path) not in sys.path:
+                sys.path.insert(0, str(kg_path))
+            try:
+                _ap = _import_with_timeout("admin_panel")
+                if _ap is None:
+                    return None
+                log.info("[Admin] Remote admin panel loaded from %s", kg_path)
+                return _ap.open_dialog
+            except Exception as exc:
+                log.warning("[Admin] admin_panel.py found at %s but failed to import: %s",
+                            kg_path, exc)
+    log.warning("[Admin] Remote admin flag set but admin_panel.py not found in KeyGen")
+    return None
+
+
+def _is_admin_host() -> bool:
+    """Does this machine HOST the console -- i.e. should it run the admin
+    SERVER -- regardless of whether the console's UI can render here?
+
+    Until 2026-09-19 this was `_find_admin_open_fn() is not None`, which made
+    the answer depend on a successful `import forex_admin` -- and that module
+    imports NiceGUI. The React app (MooreSi/forex-gold) removed NiceGUI from
+    its dependencies entirely on 2026-09-18, so on a clean install of that app
+    the import fails, this reads False, and **the licence-issuer Mac quietly
+    starts the remote CLIENT instead of the server** -- dialling a fleet
+    server that is not running, with no fleet and no console.
+
+    It only worked at all because a stale `nicegui` happened to be left in
+    that app's virtualenv. Hosting the fleet is a property of the machine
+    (issuer hardware + a console checkout + not already somebody's client),
+    not of which UI toolkit is installed, so it is decided from those.
+
+    `admin_open_fn` is still the NiceGUI import, because that genuinely is
+    "can this app draw the console" -- the two questions are now separate.
+    """
+    if _is_somebody_elses_client():
+        return False
+    if not _is_licence_issuer_machine():
+        return False
+    forex_root = Path(__file__).parent.parent.parent
+    return any((candidate / "forex_admin.py").exists()
+               for candidate in _admin_checkout_candidates(forex_root))
+
+
+admin_open_fn = _find_admin_open_fn()
+# Only the machine hosting the console runs the admin SERVER. A granted remote
+# admin gets a console (admin_panel.py, driven over the WS connection) and
+# therefore ADMIN_AVAILABLE too, but it must keep dialling the server rather
+# than becoming one -- so the two facts are kept apart.
+LOCAL_ADMIN_AVAILABLE = _is_admin_host()
+if admin_open_fn is None:
+    admin_open_fn = _find_remote_admin_open_fn()
+ADMIN_AVAILABLE = admin_open_fn is not None
+
+
+def _should_start_remote_server() -> bool:
+    """True on the machine that issues licences: a console checkout present,
+    the issuer hardware, AND an admin password set. Everything else runs the
+    client (see startup())."""
+    return LOCAL_ADMIN_AVAILABLE and password_is_set()
+
+# ── App-wide singletons ──────────────────────────────────────────────────────
+
+_engine:    Optional[TradingRuntime] = None
+_tg_reader: Optional[TelegramReader]   = None
+
+
+# RuntimeError rather than assert: `python -O` strips assert statements, and
+# these two are the app's only guard against handing out a None engine. Under
+# -O the accessor would return None and the caller would fail somewhere else
+# entirely, with an AttributeError that says nothing about what went wrong.
+# Nothing runs this with -O today; the point is that it would break quietly if
+# anything ever did.
+def get_engine() -> TradingRuntime:
+    if _engine is None:
+        raise RuntimeError("Engine not initialised")
+    return _engine
+
+
+def get_tg_reader() -> TelegramReader:
+    if _tg_reader is None:
+        raise RuntimeError("TelegramReader not initialised")
+    return _tg_reader
+
+
+async def _signal_engine_watchdog_loop() -> None:
+    """App-level recovery loop: if any signal engine is enabled but not running,
+    restart it. Runs every 5 minutes independently of each engine's own watchdog."""
+    while True:
+        await asyncio.sleep(300)
+        _signal_engine_watchdog_pass()
+
+
+def _signal_engine_watchdog_pass() -> None:
+    """One check. An engine the other node stood down (sync STAND_DOWN) is
+    down on purpose and is left alone until RESUME restarts it --
+    tests/runtime/test_app_watchdog_respects_stand_down.py."""
+    try:
+        stood_down = set(db_module.get_stood_down_engines())
+    except Exception as _e:
+        log.debug("[AppWatchdog] stood-down lookup failed: %s", _e)
+        stood_down = set()
+    try:
+        from backend.src.services.breakout_signal import breakout_signal_repo as _bodb_wd
+        if ("breakout" not in stood_down
+                and _bodb_wd.get_config("bo_engine_enabled", "1") != "0"):
+            bo = _breakout_engine_module.get_instance()
+            if bo and not bo.is_running:
+                log.warning("[AppWatchdog] Breakout engine not running — auto-restarting")
+                bo.start()
+    except Exception as _e:
+        log.debug("[AppWatchdog] Breakout health check error: %s", _e)
+    try:
+        from backend.src.services.reversal_engine import reversal_engine_repo as _re_repo_wd
+        if ("reversal_engine" not in stood_down
+                and _re_repo_wd.get_config("re_user_stopped", "0") != "1"):
+            re_eng = _re_engine_module.get_instance()
+            if re_eng and not re_eng.is_running:
+                log.warning("[AppWatchdog] Reversal Engine not running — auto-restarting")
+                re_eng.start()
+    except Exception as _e:
+        log.debug("[AppWatchdog] Reversal Engine health check error: %s", _e)
+    try:
+        from backend.src.services.trend_pa import repo as _tpa_repo_wd
+        if ("trend_pa" not in stood_down
+                and _tpa_repo_wd.get_config("user_stopped", "0") != "1"):
+            tpa = _tpa_engine_module.get_instance()
+            if tpa and not tpa.is_running:
+                log.warning("[AppWatchdog] Trend PA engine not running — auto-restarting")
+                tpa.start()
+    except Exception as _e:
+        log.debug("[AppWatchdog] Trend PA health check error: %s", _e)
+
+
+def _remote_client_enabled(config) -> bool:
+    """Whether to start the outbound remote-admin/update client.
+
+    Default ON since 2026-08-26 (Q001 #5, amended). Simon uses the admin
+    console for licence permissions and to see which clients are online, so a
+    client that never connects is a broken feature.
+
+    The old default was OFF because the channel applied pushed CODE with no
+    signature check. That is no longer true: upstream 0815cc6 deleted the
+    zip-streaming push, and an admin "update" now only asks the client to run
+    its own git pull. The warning below describes what is ACTUALLY still
+    unauthenticated, because a warning that names a risk which no longer exists
+    trains people to ignore warnings.
+
+    **Rewritten 2026-09-05.** It had become exactly that. It still announced
+    "certificate verification DISABLED and no certificate pinning" and called
+    pinning "the tracked fix" -- all three untrue since bugs/014 closed this
+    channel on 2026-09-02. `remote/tls.py` now CA-verifies the internet path
+    and trust-on-first-use pins the LAN path, both BEFORE the licence token
+    leaves the machine. What is genuinely left is TOFU's first connection, and
+    only on the LAN.
+
+    Kept as a single predicate so the "is it on?" decision is testable and
+    cannot drift away from the warning.
+    """
+    if not config.get("remote_admin_client_enabled", True):
+        return False
+    log.warning(
+        "remote-admin client starting. Connections to the admin server over "
+        "the internet are verified against the certificate authority bundled "
+        "in this build. On a LAN the certificate is trusted on FIRST sight "
+        "and pinned, so on that first connection -- and only that one -- "
+        "someone on the network path could impersonate the server; "
+        "every later one must match the pin or is refused. What an "
+        "impersonator could trigger is limited to a git pull from this "
+        "checkout's own remote, not arbitrary code. Set "
+        "remote_admin_client_enabled=false to stay off the fleet. See "
+        "remote/tls.py."
+    )
+    return True
+
+
+async def _link_checkout_at_startup() -> None:
+    """Fire-and-forget wrapper: nothing about the app depends on this working,
+    so a failure is a log line, never a startup failure. A Windows machine
+    with no git gets one first, or linking and every update fail (spec 027)."""
+    try:
+        from backend.src.services.positions import core_git_install
+        await asyncio.to_thread(core_git_install.ensure_git)
+    except Exception as e:
+        log.debug("[startup] Git check could not run: %s", e)
+    try:
+        from backend.src.services.positions.core_app_update import link_checkout
+        result = await link_checkout()
+    except Exception as e:
+        log.debug("[startup] Checkout linking could not run: %s", e)
+        return
+    if result["linked"]:
+        log.info("[startup] Linked this install to GitHub at %s — updates are "
+                 "available from Settings > Update", result["sha"][:7])
+    elif result["reason"] != "already-linked":
+        log.info("[startup] This install is not linked to GitHub (%s)", result["reason"])
+
+
+async def _install_ea_at_startup() -> None:
+    """Install the repo's EA into this machine's terminals, if nothing is open.
+
+    A fresh Windows install never got the latest EA (2026-09-25): it was only
+    deployed after Update to latest, and only copied, never compiled. The
+    rules (Windows only, empty book only) are ea_deploy.install_when_idle's.
+    The open-trade count is read here, on the loop's thread, because the
+    database connection is per thread; the copying and compiling run off it.
+    """
+    from backend.src.services.broker import ea_deploy
+    from backend.src.services.trading import signal_state_repo
+    try:
+        in_use = signal_state_repo.count_book_at_stake()
+    except Exception as e:
+        log.info("[startup] EA not installed: could not check for open trades (%s)", e)
+        return
+    try:
+        result = await asyncio.to_thread(ea_deploy.install_when_idle, lambda: in_use)
+    except Exception as e:
+        log.debug("[startup] EA install could not run: %s", e)
+        return
+    if not result.get("installed"):
+        log.info("[startup] EA not installed at startup: %s", result.get("reason"))
+    if result.get("reason") == ea_deploy.NOT_WINDOWS:
+        # Reported 2026-10-01: the dashboard said the chart ran v1.08 and the
+        # app shipped v1.09, and MetaEditor on the Mac only had v1.08 to
+        # compile. Nothing can compile off Windows, but the copy is inert --
+        # it changes nothing that runs until someone compiles -- so it needs no
+        # empty-book wait. A checkout edited or pulled by hand now reaches the
+        # terminal's Experts folder. Never raises.
+        await asyncio.to_thread(ea_deploy.deploy_after_update)
+
+
+def _offer_engine_panels_to_peer() -> None:
+    """Register the Signal Generator panels as peer reports.
+
+    api/server.py does this at import, but a headless VPS (run.py
+    `_run_headless`) never imports it, so the Mac's Breakout and Reversal
+    panels were refused as "older code" by a VPS on the same commit
+    (2026-10-21). Idempotent.
+    """
+    from backend.src.api.routers import engines as _engines_router
+    _engines_router.offer_panels_to_peer()
+
+
+async def startup() -> None:
+    global _engine, _tg_reader
+    config = cfg_module.load()
+    # Per-account, NOT config["db_path"]. bugs/031: that key is the ENVIRONMENT
+    # default, and initialising from it here silently undid the correct
+    # per-account path run.py had just resolved -- an install trading account
+    # 26004592 wrote 182 trades to 25470480's ledger and sized positions off
+    # that account's corrupt -$4,904 balance. One resolver, used by both.
+    from backend.src.db import account_registry as _acct
+    from backend.src.services.broker.credentials_repo import get_mt5_credentials
+    try:
+        _creds = get_mt5_credentials()
+    except Exception:
+        _creds = None
+    db_module.init(str(_acct.db_path_for_env(
+        cfg_module.DATA_DIR, config.get("account_env", "demo"), _creds)))
+    # Captures this thread's running loop so DB calls dispatched to the
+    # dedicated worker thread (to_db_thread) can still schedule a sync
+    # coroutine back onto it — see set_main_event_loop's docstring.
+    import asyncio as _asyncio
+    _loop = _asyncio.get_running_loop()
+    db_module.set_main_event_loop(_loop)
+    _offer_engine_panels_to_peer()
+
+    # Hold a strong reference to every fire-and-forget task until it finishes.
+    # asyncio.create_task is called 183 times here with the result discarded --
+    # alerts, profit syncs, admin pushes -- and the event loop keeps only WEAK
+    # references, so any of them can be collected mid-execution. Nothing raises
+    # when that happens; the alert just never arrives. One factory covers every
+    # call site, including ones written later.
+    from backend.src.utils import background_tasks as _background_tasks
+    _background_tasks.install(_loop)
+
+    # Ensure bridge_credentials.json matches the active env so the bridge
+    # connects to the right MT5 account on (re)start.
+    env = config.get("account_env", "demo")
+    db_module.sync_bridge_credentials_file(env)
+
+    # Re-arm the auto-restart watchdog. The stop scripts disarm it so that Stop
+    # genuinely stops, which means arming has to happen on the way back up --
+    # otherwise the first clean stop would silently retire supervision for good.
+    from backend.src.services.positions import core_autostart as _autostart
+    _autostart.sync_from_setting(
+        db_module.get_app_config("auto_restart_enabled") == "1"
+    )
+
+    _engine    = TradingRuntime(config)
+    _tg_reader = _make_tg_reader(config)
+    _engine.set_telegram_reader(_tg_reader)
+
+    # Initialise breakout signal DB (completely isolated from bounce engine).
+    # breakout_signal_service.init() initializes its own repo DB internally.
+    from backend.src.config import DATA_DIR as _DATA_DIR
+    _breakout_engine_module.init(_engine._bridge)
+    # Trend PA (docs/todo/012): its own trend_pa.db and model file, beside
+    # the breakout engine's in the same data folder.
+    from backend.src.config import USER_DATA_DIR as _UDD
+    _tpa_engine_module.init(_engine._bridge, _UDD / "data")
+
+    # Initialise Reversal Engine DB (completely isolated from other engines).
+    # 2026-07-23 rebrand (was "GD Copy Engine" / gd_copy_signal.db) -- an
+    # install that already has the old file on disk gets it renamed in place
+    # so its accumulated signal history and ML training data survive; a
+    # fresh install just creates reversal_engine.db directly.
+    _old_re_db = _DATA_DIR / "gd_copy_signal.db"
+    _new_re_db = _DATA_DIR / "reversal_engine.db"
+    if _old_re_db.exists() and not _new_re_db.exists():
+        _old_re_db.rename(_new_re_db)
+    from backend.src.services.reversal_engine import reversal_engine_repo as _re_repo
+    _re_repo.init(str(_new_re_db))
+    # Reference-channel learning corpus. Lives in the RE db (one shared file)
+    # rather than the per-env core db, and imports whatever the core db of
+    # THIS environment already collected -- so demo and live train on the
+    # same history. See reversal_engine/pro_corpus.py.
+    try:
+        from backend.src.services.reversal_engine import pro_corpus_repo as _pro_corpus
+        _pro_corpus.init()
+    except Exception as _e:
+        log.error("[startup] Pro corpus init failed: %s", _e)
+    # The Telegram decision log's two tables (2026-09-18). Same database and
+    # the same reason as the corpus above: one file across demo and live, so
+    # a study does not split when the account does. Creating the schema costs
+    # nothing when the toggle is off -- and NOT creating it would turn every
+    # write into a silent debug-level failure the day it is switched on.
+    try:
+        from backend.src.services.signals import decision_log_repo as _dec_log
+        _dec_log.create_schema()
+    except Exception as _e:
+        log.error("[startup] Decision log schema failed: %s", _e)
+    # The contradiction study's two tables (2026-09-21). Same database, same
+    # reason, and the same argument for creating them while the toggle is
+    # off: a missing table turns every write into a silent debug-level
+    # failure on the day somebody switches it on.
+    try:
+        from backend.src.services.signals import contradiction_log_repo as _contra
+        _contra.create_schema()
+    except Exception as _e:
+        log.error("[startup] Contradiction study schema failed: %s", _e)
+    from backend.src.services.reversal_engine import ml_engine as _re_ml
+    _re_ml.init(str(_DATA_DIR))
+    _re_engine_module.init(_engine._bridge)
+
+    # Protect each startup step independently so a failure in one does not
+    # prevent the signal engine from starting.
+    try:
+        from backend.src.utils import loop_monitor as _loop_mon
+        _loop_mon.start()
+    except Exception as _e:
+        log.error("[startup] Loop monitor failed to start: %s", _e)
+
+    try:
+        await _tg_reader.startup()
+    except Exception as _e:
+        log.error("[startup] TelegramReader startup failed: %s", _e)
+
+    try:
+        await _engine.startup()
+    except Exception as _e:
+        log.error("[startup] TradingRuntime startup failed: %s", _e)
+
+    # The bridge is not one of the handles this restart rebuilt. On a Mac it is
+    # a Wine subprocess with the MT5 terminal behind it, and run.py leaves one
+    # that is already listening alone -- so after a demo/live switch it is
+    # still logged into the account the app just left, with the terminal on one
+    # account and every order, number and database row on the other. It reads
+    # bridge_credentials.json (synced above) only when it connects, so it has
+    # to be told. Nothing happens unless the accounts actually disagree; see
+    # services/broker/environment.align_bridge.
+    if not cfg_module.is_debug():
+        try:
+            from backend.src.services.broker import environment as _env_svc
+            await _env_svc.align_bridge(_engine._bridge)
+        except Exception as _e:
+            log.error("[startup] Could not check which account the bridge is "
+                      "on: %s", _e)
+
+    # The Bounce engine used to be started here. Its panel went on 2026-09-02,
+    # it was stopped on 2026-09-13 (bugs/046) and its code was deleted on
+    # 2026-09-14. Nothing replaces it: Breakout and Reversal below are the two
+    # signal engines this app now runs.
+
+    # Auto-start breakout engine — respect the persistent on/off preference.
+    from backend.src.services.breakout_signal import breakout_signal_repo as _bodb2
+    bo_eng = _breakout_engine_module.get_instance()
+    if bo_eng:
+        bo_eng.set_main_engine(_engine)
+        if _bodb2.get_config("bo_engine_enabled", "1") != "0":
+            bo_eng.start()
+            log.info("[startup] Breakout engine auto-started")
+        else:
+            log.info("[startup] Breakout engine auto-start suppressed (user disabled)")
+
+    # Auto-start Reversal Engine — always on unless the user explicitly stopped it.
+    # Uses re_user_stopped="1" (not re_engine_enabled) so normal app restarts
+    # don't reset the preference; only a deliberate UI stop persists a "0".
+    from backend.src.services.reversal_engine import reversal_engine_repo as _re_repo2
+    re_eng = _re_engine_module.get_instance()
+    if re_eng:
+        re_eng.set_main_engine(_engine)
+        if _re_repo2.get_config("re_user_stopped", "0") != "1":
+            re_eng.start()
+            log.info("[startup] Reversal Engine auto-started")
+        else:
+            log.info("[startup] Reversal Engine skipped (user manually stopped)")
+
+    # Auto-start Trend PA unless the owner stopped it. It only paper-trades
+    # until tpa_live_execution is switched on.
+    from backend.src.services.trend_pa import repo as _tpa_repo2
+    tpa_eng = _tpa_engine_module.get_instance()
+    if tpa_eng:
+        tpa_eng.set_main_engine(_engine)
+        if _tpa_repo2.get_config("user_stopped", "0") != "1":
+            tpa_eng.start()
+            log.info("[startup] Trend PA engine auto-started")
+        else:
+            log.info("[startup] Trend PA engine skipped (user manually stopped)")
+
+    # Local/Remote sync — resume whichever role was last configured so a
+    # headless VPS reboot (nobody present to click the settings toggle) still
+    # comes back up accepting connections, and the Mac reconnects to a
+    # previously-configured VPS without re-entering the token.
+    try:
+        if db_module.get_app_config("sync_server_enabled") == "1":
+            from backend.src.services.cluster.sync import server as _sync_srv_mod
+            token = db_module.get_sync_token()
+            if token:
+                import socket as _socket
+                try:
+                    host = _socket.gethostbyname(_socket.gethostname())
+                except Exception:
+                    host = "0.0.0.0"
+                port = int(db_module.get_app_config("sync_server_port") or 8765)
+                srv = _sync_srv_mod.init(
+                    main_engine=_engine, breakout_engine=bo_eng, re_engine=re_eng,
+                )
+                await srv.start(host, port, token)
+                log.info("[startup] Sync server auto-started on port %d", port)
+            else:
+                log.warning("[startup] sync_server_enabled but no token generated — "
+                            "not starting sync server")
+    except Exception as _e:
+        log.error("[startup] Sync server auto-start failed: %s", _e)
+
+    try:
+        from backend.src.services.cluster.sync.client import SyncClient
+        _sc_host, _sc_port, _sc_token = SyncClient.load_config()
+        if _sc_host and _sc_token:
+            from backend.src.services.cluster.sync import client as _sync_cli_mod
+            _sync_cli_mod.get_instance().start(_sc_host, _sc_port, _sc_token)
+            log.info("[startup] Sync client auto-connecting to %s:%d", _sc_host, _sc_port)
+    except Exception as _e:
+        log.error("[startup] Sync client auto-start failed: %s", _e)
+
+    # App-level watchdog — recovers unexpected crashes every 5 min.
+    asyncio.create_task(_signal_engine_watchdog_loop())
+
+    # Set & Forget Auto (2026-09-24): scans for a long every 15 minutes while
+    # its switch on the page is on. Off by default, demo account only -- the
+    # refusals are in services/setforget/auto.py.
+    from backend.src.services.setforget import auto as _sf_auto
+    asyncio.create_task(_sf_auto.run_forever(get_engine, cfg_module.load))
+
+    # News calendar: start the background refresher so the signal engines read a
+    # cached snapshot instead of doing up to ~10s of blocking urllib on the event
+    # loop every cycle (backend review 2026-08-08, #5).
+    from backend.src.utils import news_calendar as _news
+    _news.ensure_started()
+
+    # Link this install to GitHub if it has never been linked (2026-09-12).
+    # The installers copy files, they never clone, so a fresh download has no
+    # .git and the Update page used to answer that with a manual "Set Up
+    # Updates" button. This changes no code: it claims the commit whose tree
+    # the installed files already are, and gives up if no recent commit
+    # matches — see core_app_update.link_checkout(). Backgrounded because it
+    # does a `git fetch`, and startup must not wait on the network.
+    asyncio.create_task(_link_checkout_at_startup())
+
+    # The latest EA into every terminal on this machine, compiled, when the
+    # book is empty (Windows; see _install_ea_at_startup).
+    asyncio.create_task(_install_ea_at_startup())
+
+    # Remote admin: server only starts on admin machine (KeyGen present + password set).
+    # Client only runs on non-admin machines — the admin Mac doesn't connect to itself.
+    if _should_start_remote_server():
+        _remote_server.start()
+    elif _remote_client_enabled(config):
+        _remote_client.start()
+    else:
+        log.info("[startup] Remote-admin client disabled (remote_admin_client_enabled=false) "
+                 "— not connecting to the fleet admin server")
+
+    log.info("FOREX Trader started on port %s (env=%s db=%s)",
+             config.get("port", 8888), env, config["db_path"])
+
+
+async def shutdown() -> None:
+    bo = _breakout_engine_module.get_instance()
+    if bo:
+        bo.stop()
+    re_eng = _re_engine_module.get_instance()
+    if re_eng:
+        re_eng.stop(persist=False)
+    _remote_client.stop()
+    _remote_server.stop()
+    from backend.src.utils import news_calendar as _news
+    _news.stop()
+    try:
+        from backend.src.services.cluster.sync import server as _sync_srv_mod, client as _sync_cli_mod
+        _srv = _sync_srv_mod.get_instance()
+        if _srv:
+            await _srv.stop()
+        _sync_cli_mod.get_instance().stop()
+    except Exception:
+        pass
+    if _engine:
+        await _engine.shutdown()
+    if _tg_reader:
+        await _tg_reader.shutdown()

@@ -1,0 +1,94 @@
+"""Fixture-duplication ratchet (stage2 phase3/040).
+
+`fresh_db` was once defined locally in 114 test files (17 variants) and
+`_FakeBridge` in 69. Every DB-internal change then breaks dozens of files
+at once, and ad-hoc fakes drift from the real bridge surface. The
+canonical `fresh_db` lives in tests/conftest.py; 35 byte-equivalent copies
+were migrated onto it (2026-08-11), and the remaining 29 equivalents on
+2026-08-27, which is why the fresh_db baseline sits at 66. The locals left
+are genuine variants — they may only shrink, never grow, until each is
+read, migrated and deleted.
+
+The shared bridge fake this file anticipated now exists, in tests/_fakes.py.
+Fifteen files carried one of two identical shapes and use it instead; it is
+still named `_FakeBridge` so this ratchet keeps counting it. The 49 that
+remain are genuine variants — fakes that raise, return particular ticks, or
+model a broker quirk one test needs.
+
+Also pins the MT5-safety invariant: no test module imports MetaTrader5.
+"""
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+TESTS = REPO / "tests"
+
+# Shrinking baselines — lower them as migrations land; never raise them.
+# 37 -> 36 on 2026-09-12: the Bounce engine's two test files shared one copy
+# via a new tests/test_signal/conftest.py. That variant opens
+# test_signal_repo rather than the main db module, so it cannot inherit the
+# canonical fixture -- but it can be written once for the package instead of
+# once per file, which is what this ratchet is actually asking for.
+# 66 -> 37 on 2026-09-11. Twenty-nine files carried a fixture that was the
+# conftest one minus `reset_db_worker_thread_connection()` and with a bare
+# `os.remove` — the exact pair that produced 50 Windows teardown errors on the
+# first Windows CI run this repo completed. They inherit `tests/conftest.py`'s
+# now. The 37 that remain are genuine variants: five still use `os.remove`
+# without the worker reset but each does extra work in the fixture body
+# (seeding a channel config, clearing an EA-bridge singleton, resetting a
+# strategy-params cache), so none can be deleted without reading it.
+FRESH_DB_LOCAL_DEFS_MAX = 36
+FAKE_BRIDGE_CLASSES_MAX = 50
+
+
+def _count(pattern: str, glob: str) -> int:
+    rx = re.compile(pattern, re.MULTILINE)
+    return sum(
+        len(rx.findall(p.read_text(encoding="utf-8"))) for p in TESTS.rglob(glob)
+    )
+
+
+def test_fresh_db_locals_only_shrink():
+    """New tests take fresh_db from tests/conftest.py — another local copy
+    is one more file that breaks when the DB layer moves."""
+    count = _count(r"^\s*def fresh_db\b", "test_*.py")
+    assert count <= FRESH_DB_LOCAL_DEFS_MAX, (
+        f"{count} local fresh_db definitions (baseline {FRESH_DB_LOCAL_DEFS_MAX}) — "
+        "use the conftest fixture instead of defining another copy"
+    )
+
+
+def test_fake_bridge_classes_only_shrink():
+    count = _count(r"^\s*class _FakeBridge\b", "*.py")
+    assert count <= FAKE_BRIDGE_CLASSES_MAX, (
+        f"{count} local _FakeBridge classes (baseline {FAKE_BRIDGE_CLASSES_MAX}) — "
+        "share a fake instead of writing another"
+    )
+
+
+def test_baselines_are_not_slack():
+    """The baselines must sit AT the real counts, not above them — slack in
+    a shrinking baseline is room to regress invisibly."""
+    assert _count(r"^\s*def fresh_db\b", "test_*.py") == FRESH_DB_LOCAL_DEFS_MAX
+    assert _count(r"^\s*class _FakeBridge\b", "*.py") == FAKE_BRIDGE_CLASSES_MAX
+
+
+def test_the_counters_can_count(tmp_path):
+    """Negative control: the scanners are not blind."""
+    rx_fresh = re.compile(r"^\s*def fresh_db\b", re.M)
+    rx_fake = re.compile(r"^\s*class _FakeBridge\b", re.M)
+    sample = "def fresh_db():\n    pass\n\nclass _FakeBridge:\n    pass\n"
+    assert rx_fresh.search(sample) and rx_fake.search(sample)
+
+
+def test_no_test_imports_metatrader5():
+    """MT5-safety: no test may import the real MetaTrader5 module — a test
+    that can reach a terminal can reach an order."""
+    offenders = [
+        str(p.relative_to(TESTS))
+        for p in TESTS.rglob("*.py")
+        if re.search(r"^\s*(import MetaTrader5|from MetaTrader5)", p.read_text(encoding="utf-8"), re.M)
+    ]
+    assert offenders == []

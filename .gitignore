@@ -1,0 +1,82 @@
+# Anchored to the repo root on purpose: the unanchored form silently
+# swallowed docs/system/domains/data/ for its whole life (caught by the
+# doc-links gate's first CI run, 2026-08-11).
+/data/
+.venv/
+.venv
+auth_server/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.session
+*.log
+.env
+.DS_Store
+config.yaml
+bridge_credentials.json
+
+# TEST module — ship .passwd intentionally, do not auto-commit it
+backend/src/services/test_signal/.passwd
+
+# Secrets / credentials — private keys, WinRM certs, SSH keys
+.claude_ssh/
+.claude_winrm/
+
+# Backups contain real config.yaml with live API keys — never commit
+backups/
+
+# Build artifacts / vendored binaries — large, generated, not source
+installer/Output/
+FOREX Trader.app/
+
+# FOREX_Trader_Setup.exe is intentionally committed (see installer/
+# BUILD_INSTALLER.md) — a fresh clone should ship a ready-to-run installer
+
+# Test/tooling caches
+.pytest_cache/
+.claude/settings.local.json
+.local/
+.coverage.json
+.coverage
+
+# NiceGUI runtime storage (sessions, app.storage) — never commit
+.nicegui/
+
+# bugs/014 — the admin channel private CA.
+# ca_cert.pem IS committed (it is the public authority the build ships).
+# ca_key.pem must NEVER be: anyone holding it can mint a certificate this app
+# trusts. It lives offline, outside this repo.
+ca_key.pem
+**/ca_key.pem
+
+# Local MT5 EA parameter presets -- machine-specific, not source
+mql5/*.set
+
+# ── React dashboard ───────────────────────────────────────────────────────────
+# node_modules is a build-time dependency of the dashboard and is never shipped;
+# frontend/dist IS shipped and is deliberately NOT ignored — the compiled bundle
+# is committed so the installer stays Python-only. See
+# docs/system/domains/frontend/010-the-react-decision.md.
+frontend/node_modules/
+frontend/tsconfig.tsbuildinfo
+frontend/*.tsbuildinfo
+
+# ── Private notes ─────────────────────────────────────────────────────────────
+# The owner's Q&A, plan packs and review snapshots live in the private repo
+# MooreSi/forex-gold-notes, checked out at these same paths by
+# tools/private_notes.sh (its git directory is .notes.git/). See CLAUDE.md,
+# "Private notes".
+/.notes.git/
+/docs/simon-handover/
+/docs/todo/
+/docs/reviews/
+
+# ── A Windows install is a checkout of this repo (installer/FOREX_Trader_Setup.iss) ──
+# These are the install's own files, never source.
+/unins*.exe
+/unins*.dat
+/python_embed/
+/installed_version.txt
+/open_browser_once

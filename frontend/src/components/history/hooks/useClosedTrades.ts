@@ -1,0 +1,86 @@
+import { useCallback } from "react";
+import { api } from "@/api/client";
+import { usePoll } from "@/hooks/usePoll";
+
+export interface TradeRow {
+  ticket: number;
+  direction: string;
+  entry_price: number;
+  exit_price: number;
+  open_ts: number;
+  close_ts: number;
+  /** The trading-clock date (YYYY-MM-DD) the backend files this close under:
+   *  the same day the header's goal and the Dashboard's Today count. */
+  day?: string | null;
+  lots: number;
+  close_lots: number[];
+  pnl: number;
+  fees: number;
+  pips: number | null;
+  duration_secs: number | null;
+  order_type: string;
+  pending_secs: number | null;
+  reason: string;
+  source: string;
+  /**
+   * Which market was open when the trade closed: "asian", "london",
+   * "overlap" or "ny". Null when the broker's record carried no close time.
+   * Attributed by the backend — `trade_table._session` says why not here.
+   */
+  session: string | null;
+  strategy: string;
+  max_tp: string;
+  rr: number | null;
+  spread_points: number | null;
+  group: [string, number] | null;
+  /**
+   * How far the trade went against us (MAE) and in our favour (MFE), in pips
+   * and in $ at the opening lots, and `capture` = pips banked / MFE pips
+   * (docs/todo/024). All null until the backend has measured the trade;
+   * `excursion_res` is then "M1" or "M5", or "none" when it could not be.
+   */
+  mae_pips?: number | null;
+  mfe_pips?: number | null;
+  mae_usd?: number | null;
+  mfe_usd?: number | null;
+  capture?: number | null;
+  excursion_res?: string | null;
+}
+
+export interface CurvePoint { ts: number; pnl: number }
+
+export interface ClosedTrades {
+  rows: TradeRow[];
+  error: string | null;
+  curve: {
+    points: CurvePoint[];
+    net: number;
+    peak: number;
+    max_drawdown: number;
+    trades: number;
+  };
+}
+
+/**
+ * The window's closed trades, and the curve drawn from them, in one read.
+ *
+ * Two panels show this — the equity curve and the trade table — and they
+ * share one request because they share the poll key. That is the whole point
+ * of `usePoll`'s registry: a second key here would mean two fetches of a row
+ * per trade on every interval, and two chances for the curve and the table
+ * under it to disagree about a moving account.
+ */
+export function useClosedTrades(days: number, today = false) {
+  // `today`: only closes since midnight on the trading clock (the Dashboard's
+  // Today window). Its own key, so it never shares a 1-day window's rows.
+  const query = today ? `days=${days}&today=true` : `days=${days}`;
+  return usePoll<ClosedTrades>(
+    today ? `history/trades/${days}/today` : `history/trades/${days}`,
+    useCallback(() => api.get<ClosedTrades>(`/api/history/trades?${query}`), [query]),
+    // 15s, as the NiceGUI table refreshed. It was 60s, and a trade that had
+    // just closed took up to a minute to appear (owner, 2026-09-29: "really
+    // slow to update"). The read is ~60ms and polls only while a tab that
+    // shows it is open and the page is visible.
+    15_000,
+  );
+}

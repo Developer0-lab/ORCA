@@ -1,0 +1,68 @@
+import { CAPABILITIES, type Capability } from "../content/capabilities";
+import { Tooltip } from "@/components/shared/Tooltip";
+
+interface CapabilitiesSectionProps {
+  settings: Record<string, unknown>;
+  onSave: (key: string, value: number) => void;
+  /** Which engine's switches to show. Each tab shows only its own. */
+  engine?: NonNullable<Capability["engine"]>;
+}
+
+function on(settings: Record<string, unknown>, key: string): boolean {
+  return Boolean(Number(settings[key] ?? 0));
+}
+
+/**
+ * One engine's capability switches (Reversal unless told otherwise).
+ *
+ * A switch whose dependency is off renders that fact beside it rather than
+ * quietly doing nothing. "Does NOTHING unless X is also on" was a tooltip in
+ * the NiceGUI panel; a tooltip is not where you put the reason a setting has
+ * no effect.
+ */
+export function CapabilitiesSection({ settings, onSave, engine = "reversal" }: CapabilitiesSectionProps) {
+  return (
+    <div className="grid gap-2 md:grid-cols-2">
+      {CAPABILITIES.map((cap) => {
+        if ((cap.engine ?? "reversal") !== engine) return null;
+        const dependencyOff = cap.dependsOn && !on(settings, cap.dependsOn.key);
+        return (
+          <label
+            key={cap.key}
+            data-testid={`capability-${cap.key}`}
+            className="flex h-full flex-col rounded border border-line bg-surface-2 p-2.5"
+          >
+            <span className="flex items-start gap-2">
+              <Tooltip label={cap.description}>
+                <input
+                  type="checkbox"
+                  aria-label={cap.label}
+                  checked={on(settings, cap.key)}
+                  onChange={(e) => onSave(cap.key, e.target.checked ? 1 : 0)}
+                  className="mt-0.5 accent-accent"
+                />
+              </Tooltip>
+              <span className="text-xs font-semibold text-ink-1">{cap.label}</span>
+            </span>
+            <span className="mt-1 text-[11px] leading-snug text-ink-3">
+              {cap.description}
+            </span>
+            {cap.dependsOn && (
+              <span
+                className={
+                  dependencyOff
+                    ? "mt-1 text-[11px] text-warning"
+                    : "mt-1 text-[11px] text-ink-3"
+                }
+              >
+                Does nothing unless “{cap.dependsOn.label}” is also on
+                ({cap.dependsOn.where})
+                {dependencyOff ? " — it is currently off." : "."}
+              </span>
+            )}
+          </label>
+        );
+      })}
+    </div>
+  );
+}

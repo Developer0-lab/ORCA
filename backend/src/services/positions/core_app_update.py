@@ -1,0 +1,800 @@
+"""GitHub-based app self-update: Settings > Update page's "Update" button
+and the header's flashing "Update Available" badge (2026-08-01).
+
+Uses `git fetch`/`git rev-parse`/`git log` against the `origin` remote
+(already configured to https://github.com/MooreSi/forex-gold.git in
+this checkout) to detect commits not yet in the local working tree, rather than
+the GitHub REST API -- avoids API rate limits/auth entirely, and reuses
+the exact same git plumbing the actual update (`git pull`) needs anyway.
+
+apply_update() does not restart the process itself -- the caller (the
+Settings > Update page / header popup) shows the result and triggers the
+actual restart via platform_utils.restart_app(), the same mechanism the
+header Power dialog's Restart button uses.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+from backend.src.services.ai import provider as ai_provider
+from backend.src.services.positions.core_git_exe import git_exe as _git_exe
+from backend.src.services.positions.core_update_set_aside import set_aside as _set_aside
+from backend.src.utils.os_utils import repo_root as _repo_root
+
+log = logging.getLogger(__name__)
+
+_REPO_ROOT = _repo_root()  # walks up for run.py -- see os_utils.repo_root()
+_BRANCH = "main"
+# The remote a machine with NO `.git` is wired to -- the installers copy, they
+# never clone, so this is every fresh download's first sight of a repository.
+# It must be the repo THIS checkout pulls from: it named MooreSi/forex (the
+# NiceGUI app) here until 2026-09-21, which meant Set Up Updates force-checked
+# out the old app over a React folder. Owner's decision that day: this
+# checkout's own repo is canonical. It was `forex-react` until 2026-09-22 and
+# is `forex-gold` now; GitHub redirects the old URL, but this constant, the
+# checkout's `origin` and the tests move together. `~/Forex-Update` keeps MooreSi/forex, which
+# is its own origin -- see rules/80, this is a legitimate difference, not drift.
+_GITHUB_REPO_URL = "https://github.com/MooreSi/forex-gold"
+
+
+async def _run_git(*args: str, timeout: float = 30.0) -> tuple[int, str, str]:
+    def _sync() -> tuple[int, str, str]:
+        proc = subprocess.run(
+            [_git_exe() or "git", *args], cwd=str(_REPO_ROOT), capture_output=True, text=True, timeout=timeout,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    return await asyncio.to_thread(_sync)
+
+
+# Why get_commit_report() couldn't produce a SHA. Sent verbatim to the admin
+# console (remote/client.py -> remote/server.py) so its Remote Clients card can
+# say what's actually wrong with a client instead of guessing.
+COMMIT_NO_CHECKOUT   = "no-checkout"    # never updated: install scripts copy files, never clone
+COMMIT_GIT_UNREADABLE = "git-unreadable"  # .git is there but neither git nor a direct read worked
+
+
+def _restart() -> None:
+    """Relaunch the app -- the same mechanism the header's Power dialog uses.
+    Spawns a detached run.py after a delay, then asks the running NiceGUI
+    server to shut down (graceful; not a hard os._exit -- see
+    os_utils.restart_app's own docstring). A module-level seam so tests can
+    stub it instead of actually spawning a process."""
+    from backend.src.utils.os_utils import restart_app
+    restart_app(_REPO_ROOT)
+
+
+def _is_sha(value: str) -> bool:
+    return len(value) == 40 and all(c in "0123456789abcdef" for c in value.lower())
+
+
+def _read_sha_from_git_dir() -> str:
+    """HEAD's SHA read straight off .git, with no `git` process involved.
+
+    The install scripts only ever put a working `git` on the machine when
+    Homebrew is present ("FOREX Start.command"), and on macOS an Xcode
+    Command Line Tools stub or a "dubious ownership" refusal makes every
+    `git` invocation exit non-zero even in a perfectly good checkout. Reading
+    the ref files is enough to answer "which commit is this?", so commit
+    reporting shouldn't be lost to any of that.
+
+    Returns the full 40-char SHA, or "" if anything about the layout is
+    unexpected -- this is a best-effort fallback, never a hard requirement.
+    """
+    git_path = _REPO_ROOT / ".git"
+    try:
+        if git_path.is_file():
+            # Linked worktree / submodule: ".git" is a file "gitdir: <path>".
+            text = git_path.read_text(encoding="utf-8").strip()
+            if not text.startswith("gitdir:"):
+                return ""
+            git_dir = Path(text.split(":", 1)[1].strip())
+            if not git_dir.is_absolute():
+                git_dir = (_REPO_ROOT / git_dir).resolve()
+        else:
+            git_dir = git_path
+
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        if not head.startswith("ref:"):
+            return head if _is_sha(head) else ""
+        ref = head.split(":", 1)[1].strip()
+
+        # A linked worktree keeps its own HEAD but shares refs with the main
+        # repo, pointed at by its "commondir" file.
+        search_dirs = [git_dir]
+        commondir_file = git_dir / "commondir"
+        if commondir_file.exists():
+            common = Path(commondir_file.read_text(encoding="utf-8").strip())
+            if not common.is_absolute():
+                common = (git_dir / common).resolve()
+            search_dirs.append(common)
+
+        for d in search_dirs:
+            loose = d / ref
+            if loose.is_file():
+                sha = loose.read_text(encoding="utf-8").strip()
+                if _is_sha(sha):
+                    return sha
+        for d in search_dirs:
+            packed = d / "packed-refs"
+            if not packed.is_file():
+                continue
+            for line in packed.read_text(encoding="utf-8").splitlines():
+                if line.startswith("#") or line.startswith("^"):
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) == 2 and parts[1].strip() == ref and _is_sha(parts[0]):
+                    return parts[0].strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def get_commit_report(short: bool = True) -> tuple[str, str]:
+    """(sha, reason) for this install's HEAD commit, with no network call
+    (unlike check_for_update(), which does a `git fetch`) -- safe to call
+    cheaply and often, e.g. on every remote-client heartbeat.
+
+    `reason` is "" whenever a SHA was found, and otherwise one of the
+    COMMIT_* constants above explaining why there isn't one. The distinction
+    matters to the admin console: COMMIT_NO_CHECKOUT is the normal state of a
+    freshly installed machine (the .bat/.command scripts copy files rather
+    than cloning, so .git only appears after apply_update() bootstraps it),
+    not a fault, whereas COMMIT_GIT_UNREADABLE means a checkout is there but
+    unreadable and worth looking at.
+    """
+    if not (_REPO_ROOT / ".git").exists():
+        return "", COMMIT_NO_CHECKOUT
+    try:
+        args = [_git_exe() or "git", "rev-parse", *(["--short"] if short else []), "HEAD"]
+        proc = subprocess.run(
+            args, cwd=str(_REPO_ROOT), capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip(), ""
+        log.debug("[Update] git rev-parse failed (rc=%s): %s",
+                  proc.returncode, proc.stderr.strip()[:200])
+    except Exception as e:
+        log.debug("[Update] git rev-parse could not run: %s", e)
+
+    sha = _read_sha_from_git_dir()
+    if sha:
+        return (sha[:7] if short else sha), ""
+    return "", COMMIT_GIT_UNREADABLE
+
+
+# Probed once per process, then remembered -- including a failure. On a Mac
+# without the Xcode Command Line Tools, invoking `git` can raise the "install
+# the developer tools" dialog, and the heartbeat that reports this runs every
+# ~60s. One dialog per app run is a bug report; one a minute is unusable. The
+# cost is that installing git while the app is running is not noticed until
+# the next restart, which is the right way round.
+_GIT_VERSION: Optional[str] = None
+
+
+def get_git_version() -> str:
+    """The version of the `git` on this machine, e.g. "2.39.5", or "" when
+    there isn't a usable one.
+
+    Reported alongside the commit on every client heartbeat. COMMIT_NO_CHECKOUT
+    is about the absence of `.git` and says nothing about the binary, so the
+    admin console could not tell a machine that has never self-updated from one
+    that CANNOT -- and every update is a `git fetch`/`git pull`.
+    """
+    global _GIT_VERSION
+    if _GIT_VERSION is not None:
+        return _GIT_VERSION
+    _GIT_VERSION = ""
+    try:
+        proc = subprocess.run(
+            [_git_exe() or "git", "--version"], capture_output=True, text=True, timeout=5,
+        )
+    except Exception as e:
+        log.debug("[Update] git --version could not run: %s", e)
+        return _GIT_VERSION
+    # "git version 2.39.5 (Apple Git-154)" -> "2.39.5". Anything else (a CLT
+    # stub's xcrun error, an empty line) leaves it blank rather than guessing.
+    parts = proc.stdout.strip().split()
+    if proc.returncode == 0 and len(parts) >= 3 and parts[0] == "git":
+        _GIT_VERSION = parts[2]
+    return _GIT_VERSION
+
+
+def get_local_commit_sha(short: bool = True) -> str:
+    """This checkout's current HEAD commit, or "" if it can't be determined.
+    Thin wrapper over get_commit_report() for callers that don't need to know
+    why it's missing."""
+    return get_commit_report(short)[0]
+
+
+async def check_for_update() -> dict:
+    """Fetch origin and compare local HEAD against origin/<branch>.
+
+    Returns:
+      {"available": bool, "local_sha": str, "remote_sha": str,
+       "commits": [{"sha","short_sha","summary"}, ...], "error": str|None}
+    `commits` is every commit in HEAD..origin/<branch>, newest first -- the
+    change summary shown in the header popup and the Update page. Network/
+    git failures return {"available": False, "error": "<message>"} rather
+    than raising, so a flaky connection never breaks the page that calls
+    this on a timer.
+    """
+    if not (_REPO_ROOT / ".git").exists():
+        # A fresh install has no .git: the Setup & Start scripts copy files,
+        # they never clone. apply_update() bootstraps one (git init + remote
+        # add + checkout -B), so this is a state the user can leave in one
+        # click -- but only if there is a git binary to do it with. Until
+        # 2026-09-06 both cases came back as a bare "not a git checkout" and
+        # the Update page rendered "Check failed" with no button at all, so
+        # the bootstrap was unreachable from the machine that needed it.
+        if not _git_exe():
+            return {"available": False, "bootstrap": False, "error": (
+                "git is not installed on this machine, so this install cannot "
+                "update itself. macOS: run 'xcode-select --install'. Windows: "
+                "re-run 'Setup & Start FOREX.bat', which installs it."
+            )}
+        # Linking normally happens by itself on startup (link_checkout()), and
+        # without moving the working tree. Reaching here means that could not
+        # identify which commit this install is -- the files have been edited,
+        # or they are older than the last _LINK_SEARCH_DEPTH commits, or GitHub
+        # was unreachable at the time. The button is the manual way out and it
+        # is NOT the same operation: it force-checkouts origin's HEAD.
+        return {"available": False, "bootstrap": True, "error": (
+            "this install could not be matched to a commit on GitHub, so it is "
+            "not linked yet. Update to Latest pulls the current version and "
+            "links it; anything changed in this folder is replaced."
+        )}
+
+    rc, _, err = await _run_git("fetch", "origin", _BRANCH)
+    if rc != 0:
+        return {"available": False, "error": (err.strip() or "git fetch failed")[:200]}
+
+    rc, local_sha, _ = await _run_git("rev-parse", "HEAD")
+    if rc != 0:
+        return {"available": False, "error": "could not resolve local HEAD"}
+    local_sha = local_sha.strip()
+
+    rc, remote_sha, _ = await _run_git("rev-parse", f"origin/{_BRANCH}")
+    if rc != 0:
+        return {"available": False, "error": f"could not resolve origin/{_BRANCH}"}
+    remote_sha = remote_sha.strip()
+
+    if local_sha == remote_sha:
+        return {"available": False, "local_sha": local_sha, "remote_sha": remote_sha,
+                "commits": [], "error": None}
+
+    rc, log_out, _ = await _run_git(
+        "log", f"{local_sha}..{remote_sha}", "--no-merges", "--pretty=format:%H%x1f%h%x1f%s",
+    )
+    commits = []
+    if rc == 0 and log_out.strip():
+        for line in log_out.strip().splitlines():
+            parts = line.split("\x1f")
+            if len(parts) == 3:
+                commits.append({"sha": parts[0], "short_sha": parts[1], "summary": parts[2]})
+
+    # Differing SHAs are NOT an update on their own: they are equally true when
+    # this checkout is AHEAD of origin (an unpushed local commit) or has
+    # diverged. `local..remote` lists what origin has that we do not, so an
+    # empty range in the ahead direction is the honest answer "nothing to
+    # pull". Until 2026-09-04 the badge flashed permanently on any development
+    # machine with an unpushed commit, and offered to check out an OLDER tree;
+    # the popup then had no commits to list and nothing to summarise, which is
+    # how it was reported ("could not be read").
+    #
+    # A log we could not READ (rc != 0) is a different fact from a range that
+    # is genuinely empty, and stays "assume an update" -- knowing one exists
+    # matters more than being able to list it (see the test of that name).
+    # (`--no-merges` cannot hide a real update here: a merge brings the side
+    # branch's own non-merge commits into the range with it.)
+    available = rc != 0 or bool(commits)
+
+    return {
+        "available": available, "local_sha": local_sha, "remote_sha": remote_sha,
+        "commits": commits, "error": None,
+    }
+
+
+async def tracking() -> dict:
+    """Which repository and branch an update would come from.
+
+    Read from `origin` rather than from `_GITHUB_REPO_URL`: the constant is
+    what a bootstrap would CREATE, and says nothing about what this checkout
+    actually fetches from. The two differ here -- this repo's origin is
+    `MooreSi/forex-gold` -- and a screen that shows the constant is telling
+    the operator about somewhere else.
+
+    `_BRANCH` is likewise not always the branch the app is RUNNING. Which
+    branch an install follows is the owner's decision; naming it on screen is
+    how they get to notice it is not the one they expected.
+    """
+    rc, out, _ = await _run_git("remote", "get-url", "origin")
+    url = out.strip() if rc == 0 else ""
+    # `.git` is how git writes it and not how anyone links to it.
+    if url.endswith(".git"):
+        url = url[:-4]
+    return {"branch": _BRANCH, "repo_url": url}
+
+
+# ── The header badge's cached view of the check ────────────────────────
+# `check_for_update` runs `git fetch`, which takes as long as the network takes.
+# The header that shows the badge is polled every five seconds, so it cannot
+# call it: that would be a fetch per poll, and a header that stalls with the
+# connection. It reads this instead -- the last answer, refreshed behind the
+# caller at most every ten minutes.
+
+UPDATE_CHECK_TTL_SECS = 600.0
+
+# A seam, so a test can move time without sleeping for ten minutes.
+_monotonic = time.monotonic
+
+_check_cache: dict = {"at": 0.0, "result": {"available": False}}
+_check_task: Optional["asyncio.Task"] = None
+
+
+def reset_update_cache() -> None:
+    """Forget the last check. For tests -- nothing in the app calls it."""
+    global _check_task
+    _check_cache["at"] = 0.0
+    _check_cache["result"] = {"available": False}
+    _check_task = None
+
+
+async def _refresh_update_cache() -> None:
+    """Run a real check and remember it, however it goes.
+
+    The timestamp is written in EVERY case, including the failure one. A
+    machine with no network would otherwise be permanently stale and start a
+    `git fetch` on every five-second poll, forever.
+    """
+    try:
+        result = await check_for_update()
+        if isinstance(result, dict):
+            _check_cache["result"] = result
+    except Exception as e:  # a badge is never worth an exception upwards
+        log.debug("[Update] background check failed: %s", e)
+    finally:
+        _check_cache["at"] = _monotonic()
+
+
+def cached_update_check() -> dict:
+    """The last known answer to "is there an update", without waiting for git.
+
+    Returns immediately, always. The first call -- and any call made once the
+    answer is older than `UPDATE_CHECK_TTL_SECS` -- also schedules a refresh,
+    whose result the NEXT caller sees. A refresh already in flight is never
+    duplicated.
+    """
+    global _check_task
+    stale = _check_cache["at"] == 0.0 or (
+        _monotonic() - _check_cache["at"] >= UPDATE_CHECK_TTL_SECS
+    )
+    if stale and (_check_task is None or _check_task.done()):
+        try:
+            _check_task = asyncio.get_running_loop().create_task(
+                _refresh_update_cache(),
+            )
+        except RuntimeError:
+            # No running loop: a synchronous caller. Answering what we have is
+            # right; raising at one would take the whole header response down.
+            _check_task = None
+    return dict(_check_cache["result"])
+
+
+# ── Plain-English summary of a pending update ────────────────────────────────
+# The header's "Update Available" popup used to show nothing but the raw commit
+# subjects (and "New commits are available." when even those were missing),
+# which says very little to whoever is actually running the app. These two
+# functions turn HEAD..origin/<branch> into a short "here's what changes for
+# you" blurb via the configured AI provider (Settings > AI), with the commit
+# subjects kept as the fallback whenever no provider is configured or the call
+# fails -- the update itself must never depend on an LLM being reachable.
+
+_DIGEST_MAX_CHARS = 12000  # roughly 3k tokens; plenty for a normal update
+
+_SUMMARY_SYSTEM = (
+    "You explain a pending software update to the trader who runs this app on "
+    "their own machine. You are given the git commit log for the update. "
+    "Reply with 3-6 single-line bullet points, each starting with '- ', and "
+    "nothing else: no preamble, no closing line, no headings, no commit "
+    "hashes, no file names. Group related commits into one bullet. Say what "
+    "each change means in practice for someone using the app. Fold purely "
+    "internal work (tests, refactoring, logging, docs) into a single final "
+    "bullet rather than one bullet each."
+)
+
+
+async def changes_digest(local_sha: str, remote_sha: str, max_commits: int = 40) -> str:
+    """Commit messages plus a file-level diffstat for local_sha..remote_sha,
+    trimmed to _DIGEST_MAX_CHARS -- the raw material summarise_changes() feeds
+    to the LLM. "" if the range can't be read (not a checkout, unknown SHA)."""
+    if not local_sha or not remote_sha:
+        return ""
+
+    rc, log_out, _ = await _run_git(
+        "log", f"{local_sha}..{remote_sha}", "--no-merges",
+        f"-n{max_commits}", "--pretty=format:* %s%n%b",
+    )
+    if rc != 0 or not log_out.strip():
+        return ""
+
+    parts = ["Commits in this update (newest first):", log_out.strip()]
+    rc, stat_out, _ = await _run_git("diff", "--stat", f"{local_sha}..{remote_sha}")
+    if rc == 0 and stat_out.strip():
+        parts += ["", "Files changed:", stat_out.strip()]
+
+    digest = "\n".join(parts)
+    if len(digest) > _DIGEST_MAX_CHARS:
+        digest = digest[:_DIGEST_MAX_CHARS] + "\n[... truncated ...]"
+    return digest
+
+
+async def summarise_changes(
+    local_sha: str, remote_sha: str, cfg: Optional[dict] = None, timeout: int = 45,
+) -> tuple[list[str], str]:
+    """(bullets, error) describing what the pending update changes.
+
+    `bullets` is a list of plain-English one-liners with no leading marker.
+    On any failure it comes back empty and `error` says why, so the caller can
+    fall back to the raw commit subjects -- callers must treat a summary as a
+    nicety, never as a precondition for updating.
+    """
+    from backend.src.services.ai import provider
+
+    if cfg is None:
+        import backend.src.config as cfg_module
+        cfg = cfg_module.load()
+
+    if not ai_provider.is_configured(cfg):
+        return [], "no AI provider configured (Settings > AI)"
+
+    digest = await changes_digest(local_sha, remote_sha)
+    if not digest:
+        return [], "no commit details available"
+
+    try:
+        text = await ai_provider.complete(
+            cfg, _SUMMARY_SYSTEM, digest, max_tokens=700, timeout=timeout,
+        )
+    except Exception as e:
+        log.debug("[Update] change summary failed: %s", e)
+        return [], f"{type(e).__name__}: {e}"[:200]
+
+    bullets = []
+    for line in text.splitlines():
+        line = line.strip().lstrip("-*•").strip()
+        if line:
+            bullets.append(line)
+    if not bullets:
+        return [], "empty summary from AI provider"
+    return bullets, ""
+
+
+async def commit_summary(sha: str) -> str:
+    """One-line commit message for `sha` in this checkout, "" on any failure
+    (unknown sha, not a git checkout, etc). Used by the admin console's
+    Versions tab to show what a commit SHA actually is, not just its hash."""
+    if not sha:
+        return ""
+    rc, out, _ = await _run_git("log", "-1", "--pretty=%s", sha)
+    return out.strip() if rc == 0 else ""
+
+
+async def commits_behind(sha: str) -> Optional[int]:
+    """How many commits `sha` is behind origin/<branch> in this checkout.
+    None (not 0) if `sha` can't be resolved at all -- a client on a fork/
+    stale ref this checkout has never fetched, not a client that's merely
+    caught up. Caller should already have fetched (check_for_update() does
+    this) so origin/<branch> is current; this does not fetch on its own."""
+    if not sha:
+        return None
+    rc, out, _ = await _run_git("rev-list", "--count", f"{sha}..origin/{_BRANCH}")
+    if rc != 0:
+        return None
+    try:
+        return int(out.strip())
+    except ValueError:
+        return None
+
+
+# ── Linking a downloaded install to GitHub ───────────────────────────────────
+# The installers copy files, they never clone, so a fresh download has no .git
+# and nothing to compare against origin. Until 2026-09-12 the Update page
+# answered that with a manual "Set Up Updates" button, which ran apply_update()
+# -- and apply_update() force-checkouts origin's HEAD over the working tree.
+# On a machine whose files are a few commits old, pressing it is a silent code
+# update on a machine that may be trading.
+#
+# link_checkout() does the honest half only: create the repository, fetch
+# origin, and claim the commit whose tree the installed files ALREADY are,
+# found by comparing content rather than assuming a download is current. HEAD
+# then tells the truth, check_for_update() works, the header badge and the
+# admin console's Up to date / Outdated badge are right, and not one byte of
+# the working tree has moved. Updating stays a deliberate press of Update.
+#
+# When nothing recent matches it puts back the .git it made, because a
+# repository with an unborn HEAD is worse than none -- check_for_update() would
+# stop offering the bootstrap and fail on `rev-parse HEAD` instead -- and
+# because claiming origin/main for files that are not origin/main is the exact
+# mismatch this was written to remove.
+
+_LINK_SEARCH_DEPTH = 50   # a download older than this is a manual decision
+
+
+def _index_blobs(ls_files_output: str) -> dict:
+    """{path: blob sha} from `git ls-files -s` ("<mode> <sha> <stage>\t<path>")."""
+    blobs = {}
+    for line in ls_files_output.splitlines():
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if path and len(parts) >= 2:
+            blobs[path] = parts[1]
+    return blobs
+
+
+def _tree_blobs(ls_tree_output: str) -> dict:
+    """{path: blob sha} from `git ls-tree -r` ("<mode> <type> <sha>\t<path>").
+
+    The mode is dropped on both sides deliberately. Unzipping a GitHub archive
+    can land the `.command` launchers as 100644 where the tree has 100755, and
+    comparing modes would make a byte-identical download match no commit at all.
+    """
+    blobs = {}
+    for line in ls_tree_output.splitlines():
+        meta, _, path = line.partition("\t")
+        parts = meta.split()
+        if path and len(parts) >= 3 and parts[1] == "blob":
+            blobs[path] = parts[2]
+    return blobs
+
+
+# What an install folder holds that is not the app's source. The installer
+# ships no .gitignore, so without these `add -A` staged the whole venv and the
+# downloaded Python, and no commit could ever match.
+_INSTALL_LOCAL_PATHS = (
+    ".venv/", "python_embed/", "installed_version.txt", "open_browser_once", "__pycache__/",
+    "*.pyc", "*.pyo", "*.log", "*.db", "config.yaml", "/data/", "mql5/*.set",
+    "*.tsbuildinfo", ".DS_Store", "node_modules/",
+)
+
+
+def _make_writable_and_retry(func, path, _exc_info) -> None:
+    """rmtree hook: git's objects are read-only, which Windows will not delete."""
+    import os
+    import stat
+    for p in (os.path.dirname(path), path):
+        try:
+            os.chmod(p, stat.S_IRWXU)
+        except OSError:
+            pass
+    func(path)
+
+
+def _discard_new_git_dir() -> None:
+    git_dir = _REPO_ROOT / ".git"
+    try:
+        if git_dir.is_dir():
+            shutil.rmtree(git_dir, onerror=_make_writable_and_retry)
+    except Exception as e:                      # pragma: no cover -- best effort
+        log.warning("[Update] could not remove the half-built .git: %s", e)
+
+
+def _is_abandoned_link() -> bool:
+    """A .git a failed link attempt could not remove: symbolic HEAD and no local
+    branch, loose or packed. Read off the files; any branch of its own keeps it."""
+    git_dir = _REPO_ROOT / ".git"
+    heads, packed = git_dir / "refs" / "heads", git_dir / "packed-refs"
+    try:
+        return (git_dir.is_dir()
+                and (git_dir / "HEAD").read_text(encoding="utf-8").startswith("ref:")
+                and not (heads.is_dir() and any(p.is_file() for p in heads.rglob("*")))
+                and not (packed.is_file()
+                         and "refs/heads/" in packed.read_text(encoding="utf-8")))
+    except OSError:
+        return False
+
+
+async def link_checkout() -> dict:
+    """Give a copied install a git checkout at the commit it already is.
+
+    Returns {"linked": bool, "sha": str, "reason": str}. `reason` is one of
+    "already-linked", "no-git", "init-failed", "remote-failed", "fetch-failed",
+    "empty-tree", "no-matching-commit", "linked". Never raises and never
+    modifies the working tree: the caller runs it on every startup.
+    """
+    if (_REPO_ROOT / ".git").exists():
+        if not _is_abandoned_link() or not _git_exe():
+            return {"linked": False, "sha": "", "reason": "already-linked"}
+        log.info("[Update] removing a half-built .git from an earlier link attempt")
+        _discard_new_git_dir()
+    if not _git_exe():
+        return {"linked": False, "sha": "", "reason": "no-git"}
+
+    def _give_up(reason: str) -> dict:
+        _discard_new_git_dir()
+        return {"linked": False, "sha": "", "reason": reason}
+
+    rc, _, err = await _run_git("init")
+    if rc != 0:
+        log.info("[Update] could not create a checkout here: %s", err.strip()[:200])
+        return _give_up("init-failed")
+
+    rc, _, err = await _run_git("remote", "add", "origin", f"{_GITHUB_REPO_URL}.git")
+    if rc != 0:
+        return _give_up("remote-failed")
+
+    rc, _, err = await _run_git("fetch", "origin", _BRANCH)
+    if rc != 0:
+        log.info("[Update] could not reach GitHub to link this install: %s",
+                 err.strip()[:200])
+        return _give_up("fetch-failed")
+
+    # `add -A` only writes the index; it honours .gitignore and info/exclude,
+    # so the venv, the config and the databases stay out of the comparison.
+    try:
+        exclude = _REPO_ROOT / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with exclude.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(_INSTALL_LOCAL_PATHS) + "\n")
+    except OSError as e:
+        log.debug("[Update] could not write info/exclude: %s", e)
+    rc, _, _ = await _run_git("add", "-A")
+    if rc != 0:
+        return _give_up("index-failed")
+    rc, out, _ = await _run_git("ls-files", "-s")
+    installed = _index_blobs(out) if rc == 0 else {}
+    if not installed:
+        return _give_up("empty-tree")
+
+    rc, log_out, _ = await _run_git(
+        "log", f"origin/{_BRANCH}", f"-n{_LINK_SEARCH_DEPTH}", "--pretty=format:%H",
+    )
+    if rc != 0:
+        return _give_up("no-matching-commit")
+
+    # Every installed file must be in the commit, byte for byte. The reverse is
+    # not required: the installer ships part of the tree (no tests/, no docs/),
+    # so the newest commit whose shipped files all match is the one this is.
+    match = ""
+    for sha in log_out.split():
+        rc, tree_out, _ = await _run_git("ls-tree", "-r", sha)
+        if rc != 0:
+            continue
+        tree = _tree_blobs(tree_out)
+        if all(tree.get(path) == blob for path, blob in installed.items()):
+            match = sha
+            break
+    if not match:
+        log.info("[Update] this install's files match no commit in the last %d on "
+                 "origin/%s — leaving it unlinked", _LINK_SEARCH_DEPTH, _BRANCH)
+        return _give_up("no-matching-commit")
+
+    # Point a real branch at it rather than leaving a detached HEAD, so a later
+    # update has something to fast-forward and `git status` is meaningful.
+    await _run_git("update-ref", f"refs/heads/{_BRANCH}", match)
+    await _run_git("symbolic-ref", "HEAD", f"refs/heads/{_BRANCH}")
+    await _run_git("reset", "--mixed")
+    await _run_git("branch", f"--set-upstream-to=origin/{_BRANCH}", _BRANCH)
+    log.info("[Update] linked this install to origin/%s at %s (no files changed)",
+             _BRANCH, match[:7])
+    return {"linked": True, "sha": match, "reason": "linked"}
+
+
+_SWEEP_SKIP = {".git", ".venv", "venv", "node_modules", ".claude"}
+
+
+def _clear_pycache() -> None:
+    """The repo's own bytecode caches, not .venv's: a pull never stales those,
+    and a dir vanished under the walk there (test_app_update_pycache_sweep)."""
+    for root, dirs, _files in os.walk(_REPO_ROOT, onerror=lambda _e: None):
+        dirs[:] = [d for d in dirs if d not in _SWEEP_SKIP]
+        if "__pycache__" in dirs:
+            dirs.remove("__pycache__")
+            shutil.rmtree(Path(root) / "__pycache__", ignore_errors=True)
+
+
+async def apply_update(restart: bool = True) -> dict:
+    """Bootstrap a git checkout if this install doesn't have one yet, then
+    fetch + force-checkout to origin/<branch>, reinstall requirements.txt
+    into the venv, and clear stale __pycache__ dirs.
+
+    This is the one code path both update entry points converge on: the
+    client's own Settings > Update button, and the admin console's Update
+    button (which now just sends MSG_GIT_UPDATE over the WS connection and
+    asks the client to run this). Bootstrapping here means it works
+    identically whichever one triggers it and however the machine was
+    originally set up -- the Setup & Start .bat/.command scripts never
+    git-clone anything, they just copy/run files, so a freshly installed
+    machine has no .git at all until its first update.
+
+    Uses `checkout -B <branch> --track origin/<branch> -f` rather than
+    `pull --ff-only`, so a drifted client still lands on origin exactly. Edits
+    to tracked files are put in `git stash` first: on 2026-10-11 the force
+    discarded three sessions of the owner's uncommitted work (see
+    core_update_set_aside). Anything a client actually needs to keep -- config.yaml, the licence
+    store, .venv, the DB -- is already gitignored and untouched by this.
+
+    Restarts on success (both a clean run and one where the post-update pip
+    install / pycache sweep failed -- see below) unless `restart=False`.
+    2026-09-03: leaving that to the caller meant a live install ran for ~40
+    minutes against a venv this function had already reinstalled dependencies
+    into, because nothing forced the restart to actually happen -- every
+    outbound HTTPS call (Telegram alerts, AI commentary, the daily email)
+    failed silently with a stale-module error for that whole window while 5
+    real trades opened with no notification at all. `restart=False` exists
+    only for the admin-console-triggered path (cluster/remote/_update.py),
+    which runs its own restart sequence (Windows icon refresh, then a hard
+    process exit with the bat-loop's relaunch code) and must keep doing that
+    instead of being pre-empted here.
+
+    Returns {"ok": bool, "error": str|None}.
+    """
+    if not (_REPO_ROOT / ".git").exists():
+        if not _git_exe():
+            return {"ok": False, "error": "git not found on PATH — cannot bootstrap a checkout"}
+        rc, out, err = await _run_git("init")
+        if rc != 0:
+            return {"ok": False, "error": (err.strip() or out.strip() or "git init failed")[:300]}
+        rc, out, err = await _run_git("remote", "add", "origin", f"{_GITHUB_REPO_URL}.git")
+        if rc != 0:
+            return {"ok": False, "error": (err.strip() or out.strip() or "git remote add failed")[:300]}
+
+    rc, out, err = await _run_git("fetch", "origin", _BRANCH)
+    if rc != 0:
+        return {"ok": False, "error": (err.strip() or out.strip() or "git fetch failed")[:300]}
+    refused = await asyncio.get_running_loop().run_in_executor(None, _set_aside, _REPO_ROOT)
+    if refused:
+        return {"ok": False, "error": refused}
+    rc, out, err = await _run_git("checkout", "-B", _BRANCH, "--track", f"origin/{_BRANCH}", "-f")
+    if rc != 0:
+        return {"ok": False, "error": (err.strip() or out.strip() or "git checkout failed")[:300]}
+
+    def _pip_install() -> None:
+        req_file = _REPO_ROOT / "requirements.txt"
+        if not req_file.exists():
+            return
+        venv_pip = (
+            _REPO_ROOT / ".venv" / "Scripts" / "pip.exe" if sys.platform == "win32"
+            else _REPO_ROOT / ".venv" / "bin" / "pip"
+        )
+        if venv_pip.exists():
+            args = [str(venv_pip), "install", "--quiet", "-r", str(req_file)]
+        else:
+            args = [sys.executable, "-m", "pip", "install", "--quiet", "-r", str(req_file)]
+        subprocess.run(
+            args, cwd=str(_REPO_ROOT), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=180, check=False,
+        )
+
+    def _deploy_ea() -> None:
+        """Push the EA the pull just brought into every MetaTrader terminal on
+        this machine, so a remote user gets a new EA without touching
+        anything. Best-effort by construction: see ea_deploy.deploy_after_
+        update, which swallows its own failures -- the pull has already
+        succeeded here, and a terminal that could not be written to is the
+        state the machine was in a moment ago anyway. It cannot compile on
+        macOS (MetaEditor does nothing headless under CrossOver), so a repo
+        carrying a pre-compiled .ex5 is what makes this complete there."""
+        from backend.src.services.broker import ea_deploy
+        ea_deploy.deploy_after_update()
+
+    # Each step on its own: a sweep failure once skipped the EA deploy (VPS,
+    # 2026-09-26). The pull already succeeded, so this is a soft warning: the
+    # restart below recovers a stale cache; re-pulling isn't safe to retry.
+    failed = []
+    for step in (_pip_install, _clear_pycache, _deploy_ea):
+        try:
+            await asyncio.to_thread(step)
+        except Exception as e:
+            log.warning("[Update] post-update step %s failed: %s", step.__name__, e)
+            failed.append(f"{step.__name__}: {e}")
+    if restart:
+        _restart()
+    return {"ok": True, "error": ("update pulled, but post-update step failed: "
+                                  + "; ".join(failed)) if failed else None}

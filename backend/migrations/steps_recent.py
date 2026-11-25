@@ -1,0 +1,366 @@
+"""Schema migrations 39 onward.
+
+A continuation of `steps.py`, not a second registry. That file reached the
+800-line structure ceiling at migration 38, and its first rule is that a
+step is only ever APPENDED -- never renumbered, reordered or edited. A split
+by number keeps that rule literally true: nothing moved except where the
+text lives, and `steps.py` concatenates this onto the end so `MIGRATIONS`
+still reads 1..N in order.
+
+Same rules apply here. Append only, every statement idempotent.
+"""
+from __future__ import annotations
+
+_RECENT: list[tuple[int, str, object]] = [
+    # An ATR-sized LADDER, not just an ATR-sized TP1. use_dynamic_atr sizes
+    # the stop and TP1 from ATR and stops there, so on a volatile day the
+    # stop and first target move out and TP2 upward do not -- R constant at
+    # the first target and drifting above it. Off, so every existing
+    # template is byte-identical. docs/todo/reversal-engine/200 section 2.
+    (39, "ATR-scaled anchor ladder (2026-09-11), off by default", [
+        "ALTER TABLE ea_trade_templates ADD COLUMN atr_ladder_scale INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # Measured execution cost, per fill. Nothing in the app has ever
+    # compared the price asked for with the price received:
+    # fees_sizing.calculate_fees charges a CONSTANT estimated_slippage_
+    # points to every trade. reversal-engine/020 is trying to explain 0.53
+    # points of leakage per loss with no measurement of this at all.
+    # Written by services/broker/tca.py; read-only everywhere else.
+    (40, "Execution quality: measured slippage and spread per fill", [
+        """CREATE TABLE IF NOT EXISTS execution_quality (
+            trade_id         TEXT PRIMARY KEY,
+            mt5_ticket       INTEGER,
+            measured_at      REAL NOT NULL,
+            open_time        REAL,
+            direction        TEXT,
+            strategy         TEXT,
+            bucket           TEXT,
+            requested_price  REAL,
+            fill_price       REAL,
+            slippage_pts     REAL,
+            spread_open_pts  REAL,
+            spread_close_pts REAL,
+            spread_cost_pts  REAL,
+            cost_pts         REAL,
+            sl_dist          REAL,
+            cost_r           REAL,
+            fill_delay_s     REAL,
+            measured         INTEGER NOT NULL DEFAULT 0
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_execquality_open ON execution_quality(open_time)",
+    ]),
+
+    # Every new capability from docs/todo/reversal-engine/200, each one OFF
+    # and each default byte-identical to today's behaviour. Nothing in this
+    # step changes what the app trades; they are the switches a demo session
+    # turns on one at a time, which is the only way any of them can be
+    # attributed afterwards.
+    (41, "Reversal-engine capability switches, all off (2026-09-11)", [
+        # Section 1.1: barriers fitted to our own excursion data instead of
+        # the reference channel's fixed point offsets.
+        "ALTER TABLE vantage_risk_settings ADD COLUMN re_atr_barriers_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN re_atr_stop_mult REAL NOT NULL DEFAULT 1.2",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN re_atr_tp1_mult REAL NOT NULL DEFAULT 1.2",
+        # Section 4.2: confirmation at the level, not just arrival at it.
+        "ALTER TABLE vantage_risk_settings ADD COLUMN entry_trigger_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN entry_trigger_rejection INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN entry_trigger_deceleration INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN entry_trigger_max_range_ratio REAL NOT NULL DEFAULT 0.5",
+        # Section 5.2: the meta-labeller, which replaces the R regression.
+        "ALTER TABLE vantage_risk_settings ADD COLUMN meta_label_gate_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN meta_label_threshold REAL NOT NULL DEFAULT 0.5",
+        # Section 5.6: illiquidity that arrives on a clock, and per-tier
+        # event windows.
+        "ALTER TABLE vantage_risk_settings ADD COLUMN session_liquidity_gate_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN event_tier_gate_enabled INTEGER NOT NULL DEFAULT 0",
+        # Section 5.4. The cap is in lots and 0 means OFF, matching every
+        # other cap in this table.
+        "ALTER TABLE vantage_risk_settings ADD COLUMN vol_target_sizing_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN correlated_exposure_cap_lots REAL NOT NULL DEFAULT 0",
+        # Section 4.1: the previous-day/week, VWAP and initial-balance
+        # levels joining the candidate list.
+        "ALTER TABLE vantage_risk_settings ADD COLUMN liquidity_map_levels_enabled INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # The measured 0.372R round trip (2026-09-11) was one number covering
+    # two causes with different fixes: the fill against what the broker was
+    # QUOTING, and that quote against the price the decision was made at.
+    # The second is not the broker's doing -- it is the signal chasing or
+    # arriving late. They sum to slippage_pts, so nothing already recorded
+    # changes meaning. See services/broker/tca.py.
+    (42, "Split measured slippage into broker slippage and entry drift", [
+        "ALTER TABLE execution_quality ADD COLUMN broker_slippage_pts REAL",
+        "ALTER TABLE execution_quality ADD COLUMN entry_drift_pts REAL",
+    ]),
+
+    # Refuse a named level type. The first thing the live study measured
+    # that nothing in the app could act on: score_level rates round_5
+    # highest of all at 0.78 and it is the worst cohort on the book (210
+    # trades, -0.157R, -$1,323), because those weights were fitted against
+    # a Telegram channel's behaviour rather than against outcome. Empty,
+    # so nothing is refused until somebody names it.
+    (43, "Per-level-type refusal list, empty by default", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN re_blocked_level_types TEXT NOT NULL DEFAULT ''",
+    ]),
+
+    # The AI tuning switch (owner request 2026-09-11): when on, the
+    # configured AI re-reads the market every fifteen minutes and adjusts
+    # the capability switches itself. Off, and it can never touch sizing or
+    # live execution -- see services/reversal_engine/ai_tuner.TUNABLE.
+    (44, "AI capability tuning, off by default", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN re_ai_tuning_enabled INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # The trend gate points the wrong way in the Asian session. Measured
+    # 2026-09-12 over all 5,414 re_signals rows: in 00-07 UTC trades WITH
+    # the bias are 693 at -$6.26 (CI [-9.40,-3.12], both halves negative)
+    # and trades against it 621 at -$0.50 (CI straddles zero); outside
+    # those hours it is the other way round. Off, so the gate keeps
+    # refusing counter-trend trades everywhere until the owner says
+    # otherwise. See services/risk/governor.htf_bias_blocks.
+    (45, "Asian-session exemption for the trend gate, off by default", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN htf_bias_asian_exempt INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # CME futures context (owner request 2026-09-17). Spot XAUUSD on this
+    # broker publishes bid/ask and no Last, so there is no trade side and
+    # "volume" everywhere in this system is tick volume -- a count of quote
+    # changes, not size (see services/market/order_flow.py). GC futures are
+    # the lit venue where gold prints real size, and the only route to
+    # measured flow rather than a tick-rule proxy.
+    #
+    # NOTHING CONSUMES THIS YET. There is no CME feed in the repo; the
+    # column records the intent and capability_gates.cme_context_enabled is
+    # its only reader. Daily GC volume and open interest are free from CME;
+    # the open question is whether futures flow predicts anything about
+    # these trades, which nobody has measured -- docs/simon-handover/039.
+    (46, "CME futures context switch, off by default", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN re_cme_context_enabled INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # The Telegram decision log (2026-09-18), Parsing page. Records what the
+    # app decided about each Telegram signal and what the trade then did,
+    # plus what four gates that are currently OFF would have decided --
+    # champion and challenger, recorded, never acted on. See
+    # docs/todo/signal-validation/010.
+    #
+    # Off by default and inert when off: it sits on the order path, and the
+    # measured IME budget is 269 ms end to end with 256 ms of that the
+    # broker POST. The rows go to reversal_engine.db, which is one file
+    # across demo and live -- this column only says whether to write them.
+    (47, "Telegram decision log, off by default", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN tg_decision_log_enabled INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # Set & Forget (2026-09-19), Trading > Set & Forget. The lot size that
+    # section's Execute button sends, and nothing else. 0 means "size it from
+    # Risk per trade % and the stop distance", exactly as orb_lot_size does --
+    # same meaning, same default, so this changes nobody's behaviour.
+    #
+    # Deliberately NOT in sync/server.py's synced key list, unlike
+    # orb_lot_size. ORB has an unattended scheduler that reads the value on
+    # whichever node is trading, so the value has to reach that node. Set &
+    # Forget has no unattended path at all: every order starts with a person
+    # pressing Execute, and the lot travels WITH that order.
+    (48, "Set & Forget lot size, 0 = size from risk %", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN setforget_lot_size REAL NOT NULL DEFAULT 0",
+    ]),
+
+    # Buy/sell contradictions between sources (2026-09-21), Parsing page.
+    # Stage 1: Telegram signals reach the cross-engine signal bus, and every
+    # contradiction policy's verdict is RECORDED. Nothing is acted on -- see
+    # services/signals/contradiction.py.
+    #
+    # Off by default, and inert when off in a stronger sense than the
+    # decision log above: with this 0, a Telegram signal is not written to
+    # signal_bus at all. That table is read by a live suppression gate
+    # (has_conflict_on_bus, six hours wide on the breakout engine), so
+    # "off" has to mean the bus looks exactly as it did before the feature
+    # existed, not merely that the study is not reading it.
+    (49, "Signal contradiction study, off by default", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN tg_contradiction_log_enabled INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # Stage 2 of docs/todo/signal-validation (2026-09-21): the FIRST gate
+    # promoted from the decision log's shadow record onto the Telegram
+    # execution path. Unlike 47 and 49 above, this one can refuse a trade.
+    #
+    # Its own column rather than the existing `event_tier_gate_enabled`,
+    # which the Reversal Engine's live path already reads through
+    # capability_gates.liquidity_blocks. One switch arming two engines
+    # destroys the attribution the staged plan is built on -- "promote one
+    # at a time, because a stack promoted together cannot be attributed when
+    # the number moves". The tier windows themselves stay in
+    # event_tiers.Config: one definition, two independent decisions about
+    # who honours it.
+    #
+    # Off by default (rules/60-adding-a-tunable). The owner authorised
+    # arming it for a demo session on 2026-09-21; it has not shipped on.
+    (50, "Telegram event-tier gate, off by default", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN tg_event_tier_gate_enabled INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # Three guards for the moment a backlog of queued signals is released
+    # at once (2026-09-21). A resume from the daily-loss halt opened two
+    # buys and a sell on XAUUSD inside 700ms, all within half a point: the
+    # blind-gap re-validation ran and every instantaneous gate passed,
+    # because none of them asks about the SPREAD of the release. See
+    # services/signals/stale_release.py for what each one does and why the
+    # burst guard is scoped to the pass rather than to the open book.
+    #
+    # All three OFF, and the cap's own value is the chase-side cap it
+    # mirrors (scan_auto_execute.MAX_GAP_FIRE_PTS), so the pair is inert
+    # rather than merely unused. Each can only ever REFUSE a trade the app
+    # would otherwise take, which makes switching one on a live behaviour
+    # change and a demo-session decision, not an upgrade (owner,
+    # 2026-09-21; rules/60-adding-a-tunable).
+    (51, "Stale-release guards for the queued-signal backlog, off by default", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN stale_better_fill_cap_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN stale_better_fill_cap_pts REAL NOT NULL DEFAULT 15.0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN pending_momentum_gate_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN burst_hedge_guard_enabled INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # Cross-asset context for the Reversal Engine (2026-09-23,
+    # docs/todo/reversal-engine/230). Decides only whether the META-LABELLER
+    # is trained and scores with silver, platinum, the dollar index, USDJPY,
+    # the S&P, VIX and oil. The features are recorded for every signal either
+    # way, and every refit measures both variants, so the chart shows the
+    # impact whatever this says. Places nothing unless meta_label_gate_enabled
+    # is also on. Off by default (rules/60-adding-a-tunable).
+    (52, "Cross-asset features for the meta-labeller, off by default", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN re_xasset_features_enabled INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # The Reversal Engine trades only on a proven edge (2026-09-24,
+    # docs/todo/reversal-engine/240). On, no Reversal order is placed unless
+    # its edge model has shown positive expectancy out of sample on the EA
+    # template's own exits; an unproven model REFUSES rather than letting
+    # everything through. Off by default, so nothing changes until the owner
+    # switches it on; demo only on 2026-09-24.
+    (53, "Reversal Engine trades only on a proven edge, off by default", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN re_require_proven_edge INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # One global per-trade size, and a switch that makes EA templates obey it
+    # (2026-09-25, docs/todo/risk/010). Fixed lots stays "strategy_lot_size
+    # above 0", as every order path already reads it; the parked column only
+    # remembers the lot while Risk % is chosen, for the Risk tab to show
+    # greyed out. The override is off, so every EA template still sizes
+    # itself and nothing changes size on upgrade.
+    (54, "EA template sizing override (off) and the parked fixed lot", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN global_sizing_override INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN strategy_lot_size_parked REAL NOT NULL DEFAULT 0",
+    ]),
+
+    # A daily profit goal on Risk > Stopping for the day (2026-09-29,
+    # docs/todo/risk/020). Once today's realised P&L reaches it, new entries
+    # stop for the rest of the broker day; open trades run on. `pct` is of the
+    # day's opening balance, so it compounds. Off by default.
+    #
+    # And the Trend PA engine's own live switch (docs/todo/012). Off: the
+    # engine only paper-trades until the owner turns it on, on demo first.
+    (55, "Daily profit goal (off) and the Trend PA engine's live switch (off)", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN daily_goal_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN daily_goal_mode TEXT NOT NULL DEFAULT 'pct'",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN daily_goal_value REAL NOT NULL DEFAULT 1.0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN tpa_live_execution INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # Risk > Daily goal > "Move stops to breakeven once the goal is reached"
+    # (owner, 2026-09-30; positions/goal_breakeven.py). Off by default: it
+    # moves live stops, so nothing changes on upgrade until it is ticked.
+    (56, "Daily goal: move open trades to breakeven once reached (off)", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN daily_goal_protect_be INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # Entry Realignment's pip limit (owner, 2026-10-02): realign a missed or
+    # breached zone only within N pips. 0 = no limit, which is exactly the
+    # behaviour before the column existed (Limit Runner and a breach realign by
+    # any distance, the market and watcher routes realign only under IME's own
+    # cap), so nothing changes on upgrade.
+    (57, "Entry Realignment pip limit (blank)", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN lk_entry_realignment_max_pips REAL NOT NULL DEFAULT 0",
+    ]),
+
+    # Texts the AI fallback has already classified as "not a signal"
+    # (bugs/053 option 1). Only the negative verdict is kept: a text that ever
+    # produced a signal or an SL adjustment is asked again every time. Saves
+    # paying to reclassify a channel's repeated heads-up under each new id.
+    (58, "AI fallback remembers texts it was told are not signals", [
+        "CREATE TABLE IF NOT EXISTS ai_fallback_not_signal ("
+        " text_hash TEXT PRIMARY KEY, classified_at REAL NOT NULL)",
+    ]),
+
+    # Risk > Exposure > Contradiction review (handover 041, owner 2026-10-11):
+    # when two sources disagree, the market read and the AI decide which side
+    # runs (services/signals/contradiction_review.py). Off by default: it can
+    # refuse a trade, so nothing changes on upgrade until it is ticked.
+    (59, "Contradiction review between signal sources (off)", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN contradiction_review_enabled INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # Risk > Managing an open trade > "Auto strategy reads the H1 trend"
+    # (docs/todo/014, owner 2026-10-11). Off by default: Auto keeps reading
+    # the M5 cache exactly as before until it is ticked.
+    (60, "Auto templates read the H1 regime (off)", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN auto_template_h1_regime_enabled INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # The Reversal ML model's volatility-regime input (docs/todo/016). Off:
+    # the model's vector is unchanged. The data is measured either way, so
+    # turning it on reuses the stored history.
+    (61, "Reversal ML: volatility-regime feature (off)", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN re_vol_regime_feature_enabled INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # How the two engines' ML models learn (docs/todo/017). All off: each
+    # model fits exactly as before until its switch is ticked, and each one
+    # changes which signals an ML gate passes once it is, so demo first.
+    (62, "ML learning: time-decay weights, executed labels, Breakout realised R (off)", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN re_ml_time_decay_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN bo_ml_time_decay_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN re_ml_learn_from_executed INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN bo_ml_realised_r_label INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # Risk > Where a template's stop and targets land (docs/todo/019, owner
+    # 2026-10-16). Both off: every template stop, target and lot is exactly
+    # what it was until a switch is ticked, and each one moves real stops
+    # (the second also lot size) once it is, so demo first.
+    (63, "Template exits: round-number levels and forecast-volatility stops (off)", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN round_number_exits_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN vol_forecast_stops_enabled INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # How far each closed position went against us and in our favour, for
+    # the Analysis table (docs/todo/024). Measured once from candles and kept:
+    # a past price path never changes. NULL mae/mfe with resolution 'none' is
+    # a trade that could not be measured, remembered so it is not asked again.
+    # Written by services/positions/excursion_cache_repo.py only.
+    (64, "Trade excursions (MAE/MFE) cache", [
+        """CREATE TABLE IF NOT EXISTS trade_excursion_cache (
+            position_id  INTEGER PRIMARY KEY,
+            mae_price    REAL,
+            mfe_price    REAL,
+            resolution   TEXT NOT NULL,
+            computed_at  REAL NOT NULL
+        )""",
+    ]),
+
+    # Risk > Adding to a position (docs/todo/026, owner 2026-10-22). Both off:
+    # every order is placed exactly as before until a switch is ticked, and
+    # each refuses real orders once it is, so demo first.
+    (65, "Never add to a loser; count open risk toward the daily limit (off)", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN never_add_to_loser_enabled INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE vantage_risk_settings ADD COLUMN daily_limit_counts_open_risk INTEGER NOT NULL DEFAULT 0",
+    ]),
+
+    # Level types the Reversal Engine refuses in the Asian session only,
+    # added to re_blocked_level_types (owner 2026-11-17: drop round numbers
+    # in Asia). Empty, so nothing new is refused until somebody names a type.
+    (66, "Per-level-type refusal list for the Asian session, empty by default", [
+        "ALTER TABLE vantage_risk_settings ADD COLUMN re_asian_blocked_level_types TEXT NOT NULL DEFAULT ''",
+    ]),
+]

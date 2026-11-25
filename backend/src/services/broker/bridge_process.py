@@ -1,0 +1,250 @@
+"""Launching and recovering the MT5 bridge process (M4 B9b).
+
+This was SimulationEngine.start_bridge_process: native-bridge reconnect,
+Windows kill-and-relaunch, macOS Wine session teardown. Moved verbatim --
+the only edits are the two collaborators becoming parameters, and the
+repo-root lookup becoming bridge_script_path() below.
+
+That lookup is the reason this module has a named helper instead of an
+inline path expression. The original walked up from __file__ with a
+hardcoded number of "..", which encodes how deeply the *calling file* is
+nested. Moving the code changed that depth, and the failure would have
+been silent: a missing script returns False with one warning line, so the
+bridge would simply never restart. Naming it puts the depth in one place
+with a test pointed straight at it.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import subprocess
+
+log = logging.getLogger(__name__)
+
+# backend/src/services/broker/ -> backend/src/services -> backend/src ->
+# backend -> repo root. Four levels; runtime.py needed two. Pinned by
+# tests/core/test_bridge_process_relocation.py.
+_REPO_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+)
+
+
+def bridge_script_path() -> str:
+    """Absolute path to mt5_bridge.py at the repo root."""
+    return os.path.join(_REPO_ROOT, "mt5_bridge.py")
+
+
+def wine_bridge_launch(bridge_script: str) -> tuple[list[str], dict[str, str]]:
+    """The command and environment that start `bridge_script` under Wine.
+
+    Named and shared because it has two callers that must not drift: the
+    watchdog's restart below, and `run._start_mt5_bridge` at boot. They HAD
+    drifted. The watchdog spelled the launch this way and worked; boot asked
+    for a `WINE_PYTHON` environment variable that nothing in this repo sets,
+    so on 2026-09-21 -- a power cut, a cold Mac, nothing running -- boot
+    logged "WINE_PYTHON not set" and started no bridge. The app sat with a
+    dead bridge for four and a half minutes until the watchdog noticed and
+    ran this, which worked first time. One spelling, one place.
+
+    Wine maps the Mac filesystem as Z:, so both the script and the
+    credentials file are handed over as Z: paths; the bridge runs as a
+    Windows process and cannot read a POSIX one.
+    """
+    import os as _os
+    from urllib.parse import urlparse as _urlparse
+
+    from backend.src.config import load as _cfg_load, USER_DATA_DIR
+
+    cfg = _cfg_load()
+    wine = (
+        cfg.get("wine_bin")
+        or "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine"
+    )
+    if cfg.get("bridge_backend", "crossover") == "crossover":
+        bottle = _os.path.expanduser(
+            "~/Library/Application Support/CrossOver/Bottles/MetaTrader 5"
+        )
+        extra_env = {"CX_BOTTLE": bottle, "CX_NO_BROWSER": "1"}
+    else:
+        bottle = _os.path.expanduser(cfg.get("mt5_bottle_path") or "~/.wine_mt5")
+        extra_env = {}
+
+    bridge_win = "Z:" + bridge_script.replace("/", "\\")
+    win_creds = "Z:" + str(USER_DATA_DIR / "bridge_credentials.json").replace("/", "\\")
+    port = _urlparse(cfg.get("mt5_bridge_url", "")).port or 9010
+
+    env = {
+        **_os.environ,
+        "WINEPREFIX":        bottle,
+        "WINEDEBUG":         "-all",
+        "MT5_BRIDGE_PORT":   str(port),
+        "BRIDGE_CREDS_PATH": win_creds,
+        **extra_env,
+    }
+    return [wine, "C:\\Python311\\python.exe", bridge_win], env
+
+
+async def start_bridge_process(bridge, using_native_bridge: bool) -> bool:
+    """Tear down any running bridge and start a clean new one.
+
+    On Windows: kills the native mt5_bridge.py process and restarts it directly.
+    On macOS:   tears down the entire Wine session (wineserver + all children)
+                before starting a fresh instance, to avoid duplicate MT5 windows.
+
+    With NativeMT5Bridge there's no separate process at all — recovery
+    means reconnecting the in-process MT5 session instead of killing and
+    relaunching a subprocess.
+
+    Returns True if recovery was launched (not necessarily connected yet).
+    """
+    if using_native_bridge:
+        log.info("Bridge watchdog: reconnecting in-process MT5 session (native bridge)")
+        result = await bridge.reconnect()
+        ok = result.get("status") == "connected"
+        if not ok:
+            log.warning("Bridge watchdog: native reconnect failed: %s", result.get("error"))
+        return ok
+
+    import subprocess, os as _os, sys as _sys
+    from backend.src.utils import os_utils as _pu
+
+    _bridge_py = bridge_script_path()
+    if not _os.path.isfile(_bridge_py):
+        log.warning("Bridge watchdog: mt5_bridge.py not found at %s", _bridge_py)
+        return False
+
+    # ── Windows: native Python execution (no Wine) ────────────────────────
+    if _sys.platform == "win32":
+        log.info("Bridge watchdog: stopping native bridge process")
+        _pu.kill_matching("mt5_bridge.py")
+        await asyncio.sleep(2)
+        _pu.kill_matching("mt5_bridge.py", force=True)
+        await asyncio.sleep(1)
+
+        from backend.src.config import USER_DATA_DIR, get as _cfg_get
+        from urllib.parse import urlparse as _urlparse
+        _creds = str(USER_DATA_DIR / "bridge_credentials.json")
+        _bridge_port = _urlparse(_cfg_get("mt5_bridge_url", "")).port or 9010
+        _env = {
+            **_os.environ,
+            "MT5_BRIDGE_PORT":   str(_bridge_port),
+            "BRIDGE_CREDS_PATH": _creds,
+        }
+        try:
+            subprocess.Popen(
+                [_sys.executable, _bridge_py],
+                env=_env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            log.info("Bridge watchdog: Windows native bridge subprocess launched")
+            return True
+        except Exception as _e:
+            log.warning("Bridge watchdog: failed to start bridge: %s", _e)
+            return False
+
+    # ── macOS: full Wine session teardown then restart ─────────────────────
+    import signal as _signal
+
+    def _pids_of(pattern: str) -> list[int]:
+        return _pu.pids_matching(pattern)
+
+    def _kill_all(pids: list[int], sig: int) -> None:
+        for pid in pids:
+            try:
+                _os.kill(pid, sig)
+            except (ProcessLookupError, OSError):
+                pass
+
+    # Step 1: graceful shutdown of the entire Wine session
+    log.info("Bridge restart: stopping Wine session (wineserver + all children)")
+    _kill_all(_pids_of("wineserver"),    _signal.SIGTERM)
+    _kill_all(_pids_of("mt5_bridge.py"), _signal.SIGTERM)
+    await asyncio.sleep(3)
+
+    # Step 2: force-kill any survivors
+    for _pattern in ("wineserver", "mt5_bridge.py", "terminal64.exe", "winewrapper.exe"):
+        _kill_all(_pids_of(_pattern), _signal.SIGKILL)
+
+    await asyncio.sleep(2)
+
+    _remaining_mt5 = _pids_of("terminal64.exe")
+    if _remaining_mt5:
+        log.warning(
+            "Bridge restart: %d terminal64.exe process(es) still alive after kill — "
+            "proceeding; may result in duplicate MT5 if CrossOver re-uses it",
+            len(_remaining_mt5),
+        )
+    else:
+        log.info("Bridge restart: clean slate — no terminal64.exe or wineserver running")
+
+    try:
+        _cmd, _env = wine_bridge_launch(_bridge_py)
+        subprocess.Popen(
+            _cmd,
+            env=_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        log.info("Bridge watchdog: macOS Wine bridge subprocess launched")
+        return True
+    except Exception as _e:
+        log.warning("Bridge watchdog: failed to start bridge subprocess: %s", _e)
+        return False
+
+
+# ── The Settings > MT5 button (2026-09-29) ───────────────────────────────────
+#
+# Same restart as the watchdog and /restart_bridge (start_bridge_process
+# above, reached through the runtime). What differs is how the result is
+# judged: by the bridge's own health read, which answers wherever the bridge
+# lives. bot_infra.cmd_restart_bridge waits for port 9000, which this Mac's
+# bridge is not on (9010) and the in-process Windows bridge has no port at all.
+
+_RESTART_POLL_S = 3.0
+_RESTART_POLLS = 15        # 45 s: Wine takes 15-30 s to bring MT5 back
+_restart_lock = asyncio.Lock()
+
+
+async def restart_and_wait(eng) -> dict:
+    """Restart the bridge and wait for it to reconnect to MT5.
+
+    `eng` is the runtime: its start_bridge_process restarts, its
+    get_bridge_health judges. Returns {"ok", "message"}; never raises. A second
+    press while one runs restarts nothing: on the Mac each restart kills the
+    MetaTrader session the previous one is bringing up.
+    """
+    if _restart_lock.locked():
+        return {"ok": False, "message": "A bridge restart is already running."}
+    async with _restart_lock:
+        try:
+            launched = await eng.start_bridge_process()
+        except Exception as e:
+            log.warning("Bridge restart (Settings): launch raised: %s", e)
+            launched = False
+        if not launched:
+            return {"ok": False, "message": "The bridge could not be started, so nothing "
+                                            "was restarted. The app log says why."}
+        last: dict = {}
+        for _ in range(_RESTART_POLLS):
+            await asyncio.sleep(_RESTART_POLL_S)
+            try:
+                last = await eng.get_bridge_health() or {}
+            except Exception:
+                last = {}
+            if last.get("connected"):
+                break
+        if not last.get("connected"):
+            return {"ok": False, "message": (
+                f"The bridge was restarted but MT5 is not connected after "
+                f"{int(_RESTART_POLLS * _RESTART_POLL_S)} s. It keeps retrying on its "
+                f"own; watch the header's bridge badge.")}
+        log.info("Bridge restart (Settings): connected")
+        if last.get("trade_allowed") is False:
+            return {"ok": True, "message": "Bridge restarted and connected, but Algo Trading "
+                                           "is OFF in MT5. Turn on the Algo Trading button "
+                                           "in the terminal."}
+        return {"ok": True, "message": "Bridge restarted and connected to MT5."}

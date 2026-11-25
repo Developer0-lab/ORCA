@@ -1,0 +1,283 @@
+"""
+Signal construction for Reversal Engine.
+
+Builds signals that match the Gold Diggers VIP format exactly:
+  - 2-4pt entry zone
+  - SL 4pts below zone (modal value from 294-signal analysis)
+  - TP1-TP8 cascade matching the reference channel spacing pattern
+"""
+from __future__ import annotations
+
+import hashlib
+import time
+
+
+# the reference channel modal SL distances by bias strength
+_SL_DIST_BY_SCORE = {
+    "high":   7,   # score > 0.85 — wider SL for strong levels
+    "medium": 5,   # score 0.65-0.85
+    "low":    4,   # score < 0.65 — tight SL
+}
+
+# TP cascade offsets from entry_mid (points)
+# Derived from the reference channel TP spacing analysis: TP1-TP7 gaps [2,2,2,2,2,4] or [1,1,1,2,3,5]
+# We use a slightly wider cascade to capture more of the move
+_TP_OFFSETS = [3, 4, 5, 6, 8, 10, 15, 30]
+
+# Entry zone half-width
+_ZONE_HALF = 2.0  # 4pt zone total (matches the reference channel median 3pt but rounds nicely)
+
+
+def make_signal_ref() -> str:
+    raw = f"RE-{time.time()}"
+    return "RE-" + hashlib.md5(raw.encode()).hexdigest()[:6].upper()
+
+
+# Stable Telegram group IDs (never change on a channel rename) -- see
+# core_db_channel._TG_GROUP_ID_MAP, the single source of truth these
+# resolve through.
+_REF_GROUP_ID = "1608388054"
+_GD2_GROUP_ID = "2616846888"
+
+
+def _current_channel_name(is_gd2: bool) -> str:
+    """The real channel's CURRENT display name, resolved by stable group_id
+    rather than hardcoded -- see core_db_channel._TG_GROUP_ID_MAP."""
+    from backend.src.services.channels.repo import _normalise_tg_source
+    return _normalise_tg_source(_GD2_GROUP_ID if is_gd2 else _REF_GROUP_ID)
+
+
+def entry_zone_from_level(level_price: float, atr: float, direction: str) -> tuple[float, float]:
+    """
+    Create entry zone around a key level.
+
+    For BUY: zone sits just above the level (buying the pullback into support)
+    For SELL: zone sits just below the level (selling the rally into resistance)
+    """
+    # Widen zone slightly at high ATR (volatile markets need a wider zone)
+    zone_half = _ZONE_HALF
+    if atr > 15:
+        zone_half = 3.0
+
+    if direction == "BUY":
+        entry_low  = round(level_price - 1.0,  2)
+        entry_high = round(level_price + zone_half, 2)
+    else:
+        entry_high = round(level_price + 1.0,  2)
+        entry_low  = round(level_price - zone_half, 2)
+
+    return entry_low, entry_high
+
+
+def atr_barriers(atr: float, cfg: dict | None) -> tuple[float, list[float]] | None:
+    """`(sl_dist, tp_offsets)` sized from volatility, or None to leave the
+    existing geometry alone.
+
+    Section 1.1 of `docs/todo/reversal-engine/200`, enabled by the owner's
+    2026-09-11 directive that this engine no longer has to resemble Gold
+    Diggers. The stop becomes `atr * stop_mult` and the ladder is rescaled
+    so TP1 lands at `atr * tp1_mult`, which makes R constant instead of
+    varying 0.43 to 0.75 with level score.
+
+    **The ladder's SHAPE is preserved, not replaced.** The relative spacing
+    in `_TP_OFFSETS` is the one part of the reference channel's geometry
+    that encodes something real -- how far gold tends to run once a level
+    holds -- and the reach data behind it (median 0.43R, only 9.4% reaching
+    1.0R) was measured on this instrument, not borrowed.
+
+    Returns None rather than a guess when the ATR or a multiple is missing
+    or zero. Sizing a stop off a zero ATR puts it at the entry price, which
+    is not a tight stop, it is an immediate loss.
+    """
+    if not cfg or not cfg.get("enabled"):
+        return None
+    try:
+        a = float(atr or 0.0)
+        stop_mult = float(cfg.get("stop_mult") or 0.0)
+        tp1_mult = float(cfg.get("tp1_mult") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if a <= 0 or stop_mult <= 0 or tp1_mult <= 0:
+        return None
+
+    scale = (a * tp1_mult) / _TP_OFFSETS[0]
+    return a * stop_mult, [o * scale for o in _TP_OFFSETS]
+
+
+def calculate_tp_cascade(direction: str, entry_mid: float, sl_dist: float,
+                         offsets: list[float] | None = None) -> dict:
+    """
+    Build the 8-level TP cascade matching the reference channel format.
+
+    TPs are placed at FIXED point offsets from entry mid -- they do not scale
+    with sl_dist, whatever this docstring used to claim. That has a real
+    consequence worth stating plainly: sl_dist varies 4-7pt by level score
+    while TP1 stays at 3pt, so TP1 is 0.75R on a weak level and 0.43R on a
+    strong one. The better the level, the worse its payoff.
+
+    Left as fixed offsets deliberately, not from inertia: the reach data said
+    only 9.4% of signals ever travel 1.0R (median 0.43R), so scaling the
+    cascade up to a constant R would move every target beyond where price
+    actually goes and cut the win rate from 70.5% to single digits. The edge
+    is a small, high-probability move. Fixing the inversion means narrowing
+    the STOP on strong levels, not widening their targets -- which needs the
+    mae_pts now being recorded before it can be sized honestly.
+
+    **That reach figure is superseded (2026-09-11).** Measured again on 750
+    executed trades whose excursion was reconstructed from broker tick
+    history rather than sampled every five seconds:
+
+        median reach 0.562R, and 42.4% reach 1.0R
+        (26.1% reach 2.0R, 15.7% reach 3.0R)
+
+    Four and a half times the old figure. The original was computed before
+    the live path recorded excursion at all (see data-inspect/003: of 745
+    executed signals only 52 carried an MFE, none after 2026-08-28), so it
+    rested on a small and badly selected sample.
+
+    The argument above is therefore weaker than it reads, and the case for a
+    wider target is live rather than settled: the exit-policy sweep's best
+    cells all want a target far beyond the median, and every one of them has
+    a confidence interval straddling zero with the two chronological halves
+    disagreeing in sign. Neither number is safe to act on yet. Do not "fix"
+    this by widening the ladder on the strength of the new reach figure
+    alone -- see docs/todo/reversal-engine/210.
+    """
+    tps = {}
+    for i, offset in enumerate(offsets or _TP_OFFSETS, start=1):
+        if direction == "BUY":
+            tps[f"tp{i}"] = round(entry_mid + offset, 2)
+        else:
+            tps[f"tp{i}"] = round(entry_mid - offset, 2)
+    return tps
+
+
+# GD2/Institutional TP structure — NOT the REF 8-level ladder. Four weeks of
+# real follow-up messages show a scale-out-then-breakeven playbook instead:
+# "+30 pips from best entries, making my trade risk free by taking partial
+# profits" (TP1, partial + SL->BE), "Close your first entries and set
+# breakeven on the best entries" (repeats the same pattern), then a runner
+# left open with no further fixed level ("Running +200 from best entries").
+# TP1/TP2 are risk-multiples of the trade's own SL distance (so they scale
+# with how wide the confluence zone/stop actually is, not a fixed point
+# offset); the "runner" target is a wide multiple matching their observed
+# bigger wins (100-250+ pips on trend days).
+_GD2_TP1_R  = 1.0   # first partial close, matches sl_dist 1:1
+_GD2_TP2_R  = 2.0   # second partial + move SL to breakeven
+_GD2_RUNNER_R = 6.0  # final runner target, no further management
+
+
+def calculate_gd2_tp_structure(direction: str, entry_mid: float, sl_dist: float) -> dict:
+    sign = 1.0 if direction == "BUY" else -1.0
+    return {
+        "tp1": round(entry_mid + sign * _GD2_TP1_R * sl_dist, 2),
+        "tp2": round(entry_mid + sign * _GD2_TP2_R * sl_dist, 2),
+        "tp3": round(entry_mid + sign * _GD2_RUNNER_R * sl_dist, 2),
+    }
+
+
+def sl_distance_for_level(level_score: float) -> float:
+    """Return the SL distance in points based on the level quality score."""
+    if level_score >= 0.85:
+        return float(_SL_DIST_BY_SCORE["high"])
+    if level_score >= 0.65:
+        return float(_SL_DIST_BY_SCORE["medium"])
+    return float(_SL_DIST_BY_SCORE["low"])
+
+
+def build_signal(level: dict, direction: str, context: dict) -> dict:
+    """
+    Construct a complete signal dict ready for database insertion.
+
+    Args:
+        level:     candidate level dict from level_detector
+        direction: 'BUY' or 'SELL'
+        context:   dict with atr, adx, htf_bias, h1_bias, session, price_at_signal
+    """
+    atr            = float(context.get("atr", 8.0) or 8.0)
+    level_price    = float(level["price"])
+    level_score    = float(level.get("score", 0.5))
+    is_gd2         = level.get("profile") == "gd2"
+
+    if is_gd2:
+        # Unicorn levels already carry a real confluence zone (FVG x breaker
+        # block) -- use it directly instead of a synthetic point + ATR pad.
+        entry_low  = float(level.get("entry_zone_low", level_price))
+        entry_high = float(level.get("entry_zone_high", level_price))
+        entry_mid  = round((entry_low + entry_high) / 2, 2)
+        sl_dist    = max(abs(entry_high - entry_low), sl_distance_for_level(level_score))
+    else:
+        entry_low, entry_high = entry_zone_from_level(level_price, atr, direction)
+        entry_mid  = round((entry_low + entry_high) / 2, 2)
+        # ATR barriers when the owner has turned them on; otherwise the
+        # level-score stop this engine has always used. See atr_barriers().
+        #
+        # The RAW context value, not `atr` above: that one falls back to 8.0
+        # when the context carries none, which is a harmless default for
+        # widening an entry zone and a silent fiction to size a real stop
+        # from. No ATR must mean no ATR barriers, not a stop measured off a
+        # number nobody observed.
+        _fitted = atr_barriers(context.get("atr"), context.get("atr_barriers"))
+        sl_dist = _fitted[0] if _fitted else sl_distance_for_level(level_score)
+
+    if direction == "BUY":
+        stop_loss = round(entry_mid - sl_dist, 2)
+    else:
+        stop_loss = round(entry_mid + sl_dist, 2)
+
+    if is_gd2:
+        # Untouched on purpose: GD2's zone is a measured FVG/breaker overlap
+        # and its targets are already R-multiples of that zone's own width.
+        # There is no inversion here to fix, and replacing a real confluence
+        # zone with an ATR guess would be a downgrade.
+        tps = calculate_gd2_tp_structure(direction, entry_mid, sl_dist)
+    else:
+        tps = calculate_tp_cascade(direction, entry_mid, sl_dist,
+                                   offsets=_fitted[1] if _fitted else None)
+
+    tp1_dist = abs(tps["tp1"] - entry_mid)
+    rr_tp1   = round(tp1_dist / sl_dist, 2) if sl_dist > 0 else 0.0
+
+    return {
+        "signal_ref":      make_signal_ref(),
+        "created_at":      time.time(),
+        "direction":       direction,
+        "entry_low":       entry_low,
+        "entry_high":      entry_high,
+        "stop_loss":       stop_loss,
+        "sl_dist":         sl_dist,
+        "rr_tp1":          rr_tp1,
+        "level_price":     level_price,
+        "level_type":      level.get("type", "unknown"),
+        "level_score":     level_score,
+        "session":         context.get("session", ""),
+        "htf_bias":        context.get("htf_bias", ""),
+        "h1_bias":         context.get("h1_bias", ""),
+        "atr":             atr,
+        "adx":             float(context.get("adx", 0) or 0),
+        "price_at_signal": float(context.get("price_at_signal", 0) or 0),
+        "status":          "pending",
+        "outcome":         "open",
+        "strategy":        "gd2_unicorn" if is_gd2 else "signal_climber",
+        # The real channel this signal is modelled on -- reversal_engine_
+        # correlate.py's correlation check matches against this (canonicalised
+        # on both sides, so it's not sensitive to which exact name is stamped
+        # here). Resolved dynamically via _canonical() rather than a hardcoded
+        # literal -- confirmed live 2026-07-24: GD2's channel was renamed on
+        # Telegram's side ("GOLD DIGGERS 2.0 ⚡️" -> "GOLD DIGGERS
+        # INSTITUTIONAL") and a hardcoded stamp here would keep labelling
+        # every new signal with the dead pre-rename name forever.
+        "source_channel":  _current_channel_name(is_gd2),
+        **tps,
+    }
+
+
+def lot_size_for_risk(risk_dollars: float, sl_dist: float,
+                      point_value: float = 1.0) -> float:
+    """Calculate lot size to risk `risk_dollars` on a `sl_dist`-point SL."""
+    if sl_dist <= 0 or point_value <= 0:
+        return 0.01
+    raw = risk_dollars / (sl_dist * point_value * 100)
+    # Round to nearest 0.01 lot, clamp to broker limits
+    lot = round(raw / 0.01) * 0.01
+    return max(0.01, min(lot, 10.0))

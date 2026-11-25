@@ -1,0 +1,221 @@
+"""Signal Bus repo — split from core/database.py.
+Extracted from forex_trader/core/database.py -- see
+docs/todo/refactor/core-database-migration/. Verbatim port: same functions,
+same SQL, same behavior, using database.py's own db()/to_db_thread()
+machinery (unchanged, already correct -- this is a pure file-size split,
+not a connection-layer migration). Re-exported from database.py so every
+existing `db_module.<name>` call site works completely unchanged.
+"""
+import asyncio
+import json
+import logging
+import os
+import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+log = logging.getLogger(__name__)
+
+from backend.src.db.database import db, row_to_dict, to_db_thread, _schedule_coro  # noqa: E402
+
+
+# ── Signal bus ────────────────────────────────────────────────────────────────
+# Lightweight cross-engine awareness layer.  Each engine writes here when it
+# generates a signal; all engines read here at ML-scoring time to get
+# concurrent_agreement and conflict-suppression features.  Rows are auto-expired
+# by the prune helper; the table never grows large.
+
+# What produced a bus row. Until 2026-09-21 the bus carried engine rows and
+# nothing else, so the column did not exist and every historical row is an
+# engine row -- which is why every read below coalesces NULL to KIND_ENGINE
+# rather than treating it as unknown.
+KIND_ENGINE   = "engine"
+KIND_TELEGRAM = "telegram"
+
+# The default every existing reader gets. Widening it is not a refactor: the
+# breakout engine reads has_conflict_on_bus over a SIX HOUR window and
+# suppresses on a hit, so the day a Telegram row becomes visible there is the
+# day an opposing channel message starts silently cancelling engine signals.
+# A caller that wants the whole bus passes `kinds=` and owns that decision.
+DEFAULT_READ_KINDS: tuple[str, ...] = (KIND_ENGINE,)
+
+
+def _ensure_signal_bus() -> None:
+    """Idempotent: create the table if it was added after initial schema run."""
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signal_bus (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                engine        TEXT    NOT NULL,
+                direction     TEXT    NOT NULL,
+                confidence    REAL    NOT NULL DEFAULT 0.0,
+                created_at    REAL    NOT NULL,
+                expires_at    REAL    NOT NULL,
+                is_still_open INTEGER NOT NULL DEFAULT 1,
+                signal_id     INTEGER
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_bus_exp ON signal_bus(expires_at)")
+        # Migration: add new columns to existing tables.
+        # source_kind/source_name/symbol are deliberately NULLable with no
+        # DEFAULT: a backfill would claim to know what an old row was, and
+        # the readers already answer that question one way, in one place.
+        for col, defn in [
+            ("is_still_open", "INTEGER NOT NULL DEFAULT 1"),
+            ("signal_id",     "INTEGER"),
+            ("symbol",        "TEXT"),
+            ("source_kind",   "TEXT"),
+            ("source_name",   "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE signal_bus ADD COLUMN {col} {defn}")
+            except Exception:
+                pass  # column already exists
+
+
+def write_signal_bus(
+    engine: str,
+    direction: str,
+    confidence: float = 0.0,
+    ttl_seconds: float = 300.0,
+    signal_id: Optional[int] = None,
+    symbol: Optional[str] = None,
+    source_kind: str = KIND_ENGINE,
+    source_name: Optional[str] = None,
+) -> int:
+    """
+    Record a signal on the shared bus. Returns the bus row id.
+    TTL default reduced to 5 min (matches max scalp trade lifetime).
+    Call close_bus_entry() when the originating signal closes so other engines
+    see it as resolved immediately rather than waiting for TTL expiry.
+
+    `source_kind` defaults to KIND_ENGINE because every call site that
+    predates the column is an engine, and `source_name` defaults to `engine`
+    for the same reason -- for an engine the two are the same string, and a
+    Telegram row needs somewhere to put the channel name that is not the
+    `engine` column the readers key their exclusion on.
+    """
+    try:
+        _ensure_signal_bus()
+        now = time.time()
+        with db() as conn:
+            cur = conn.execute(
+                "INSERT INTO signal_bus"
+                "(engine,direction,confidence,created_at,expires_at,is_still_open,"
+                "signal_id,symbol,source_kind,source_name)"
+                " VALUES(?,?,?,?,?,1,?,?,?,?)",
+                (engine, direction.upper(), float(confidence), now, now + ttl_seconds,
+                 signal_id, symbol, source_kind or KIND_ENGINE,
+                 source_name if source_name is not None else engine),
+            )
+            return cur.lastrowid or 0
+    except Exception as _e:
+        log.debug("[SignalBus] write error: %s", _e)
+        return 0
+
+
+def close_bus_entry(engine: str, signal_id: int) -> None:
+    """
+    Mark the bus entry for this engine+signal_id as no longer open.
+    Call this as soon as the originating signal closes (SL/TP hit) so the
+    conflict check clears immediately rather than waiting for TTL expiry.
+    """
+    try:
+        _ensure_signal_bus()
+        with db() as conn:
+            conn.execute(
+                "UPDATE signal_bus SET is_still_open=0 WHERE engine=? AND signal_id=?",
+                (engine, signal_id),
+            )
+    except Exception as _e:
+        log.debug("[SignalBus] close_bus_entry error: %s", _e)
+
+
+def get_concurrent_signals(
+    exclude_engine: str,
+    window_seconds: float = 900.0,
+    kinds: tuple[str, ...] = DEFAULT_READ_KINDS,
+    symbol: Optional[str] = None,
+) -> list[dict]:
+    """
+    Return active, still-open signals from all engines except the caller.
+    is_still_open=0 entries (signal already closed) are excluded even if TTL has not expired.
+
+    `kinds` restricts the read to those source kinds and defaults to engine
+    rows only -- see DEFAULT_READ_KINDS for why that default is load-bearing
+    rather than tidy. A NULL source_kind counts as KIND_ENGINE; every row
+    written before the column existed was one.
+
+    `symbol` is opt-in and defaults to no filter, because the bus had no
+    symbol until 2026-09-21 and every existing caller compares directions
+    across whatever is on it. A row whose symbol is unknown (NULL) matches
+    any symbol: it cannot be ruled out, and treating it as a non-match would
+    quietly narrow the live suppression gate.
+    """
+    try:
+        _ensure_signal_bus()
+        cutoff = time.time() - window_seconds
+        kind_list = tuple(kinds) or DEFAULT_READ_KINDS
+        placeholders = ",".join("?" for _ in kind_list)
+        sql = (
+            "SELECT engine, direction, confidence, created_at, symbol,"
+            " COALESCE(source_kind, ?) AS source_kind,"
+            " COALESCE(source_name, engine) AS source_name, signal_id"
+            " FROM signal_bus"
+            " WHERE engine != ? AND expires_at > ? AND created_at > ?"
+            " AND is_still_open = 1"
+            f" AND COALESCE(source_kind, ?) IN ({placeholders})"
+        )
+        params: list = [KIND_ENGINE, exclude_engine, time.time(), cutoff, KIND_ENGINE]
+        params.extend(kind_list)
+        if symbol:
+            sql += " AND (symbol IS NULL OR UPPER(symbol) = UPPER(?))"
+            params.append(symbol)
+        with db() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def get_concurrent_agreement(engine: str, direction: str, window_seconds: float = 900.0) -> float:
+    """
+    Return cross-engine agreement score for use as an ML feature.
+      +1.0  one or more other engines agree (same direction)
+      -1.0  one or more other engines disagree (opposite direction)
+       0.0  no concurrent signals from other engines
+    Disagreement takes priority over agreement.
+    """
+    signals = get_concurrent_signals(exclude_engine=engine, window_seconds=window_seconds)
+    if not signals:
+        return 0.0
+    direction_up = direction.upper()
+    has_agree    = any(s["direction"] == direction_up for s in signals)
+    has_disagree = any(s["direction"] != direction_up for s in signals)
+    if has_disagree:
+        return -1.0
+    if has_agree:
+        return 1.0
+    return 0.0
+
+
+def prune_signal_bus() -> None:
+    """Delete expired rows. Call periodically (e.g. every 30 min from a tick loop)."""
+    try:
+        _ensure_signal_bus()
+        with db() as conn:
+            conn.execute("DELETE FROM signal_bus WHERE expires_at < ?", (time.time(),))
+    except Exception:
+        pass
+
+
+def has_conflict_on_bus(engine: str, direction: str, window_seconds: float = 600.0) -> bool:
+    """True if another engine has an active signal in the OPPOSITE direction."""
+    signals = get_concurrent_signals(exclude_engine=engine, window_seconds=window_seconds)
+    direction_up = direction.upper()
+    return any(s["direction"] != direction_up for s in signals)

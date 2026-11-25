@@ -1,0 +1,438 @@
+"""Exactly one node may execute new trades. This is the file that holds it.
+
+Both nodes are pointed at the same MT5 account. Two active nodes is two sets of
+engines opening positions against one balance, and nothing on either screen
+says so — it shows up as trades nobody placed.
+
+**The ordering is the behaviour.** Every test here is really about order:
+
+  * taking over asks the peer to stand down and waits for the acknowledgement
+    BEFORE this node is marked active or its engines are started;
+  * handing back stops this node's engines BEFORE asking the peer to resume.
+
+Each half is arranged so that a failure leaves the account with **no** active
+trader rather than two. That is a deliberate trade: "nothing is trading" is a
+state the operator can see and retry from, and "both are trading" is not.
+
+Nothing here touches a broker, a socket or a database. The peer is a recorder,
+the engines are recorders, and `set_active_trader` writes into a dict. What is
+being tested is a sequence of decisions, which is exactly what a test can own —
+and what a demo session cannot check cheaply, because reproducing a peer that
+fails to acknowledge means breaking a live link on purpose.
+
+**This code has not been through a demo session.** Its tests are green and that
+is not sign-off: see docs/todo/frontend/react-port/PROGRESS.md.
+"""
+from __future__ import annotations
+
+import pytest
+
+from backend.src.services.cluster import handover
+from backend.src.services.engines import registry as engine_registry
+
+# Scoped to the two async classes rather than the module: the last two tests
+# are synchronous, and a module-wide mark makes pytest warn on each of them.
+pytestmark: list = []
+
+
+class _Engine:
+    def __init__(self, running: bool):
+        self.is_running = running
+        self.events: list[str] = []
+
+    def start(self):
+        self.events.append("start")
+        self.is_running = True
+
+    def stop(self):
+        self.events.append("stop")
+        self.is_running = False
+
+
+class _Peer:
+    """The paired node, as this side can see it.
+
+    Records the order of everything, because order is the claim. `raises` makes
+    it the node that does not answer — a VPS mid-reboot, or a link that dropped
+    between the check and the request.
+    """
+
+    def __init__(self, order, conn_state="connected", ack=None, raises=None):
+        self.conn_state = conn_state
+        self.ack = ack if ack is not None else {"open_positions": []}
+        self.raises = raises
+        self.calls: list[str] = []
+        # The SHARED order list, not a private one. A peer with its own list
+        # can say "stand_down happened" and "the flag was set" but not which
+        # came first — and which came first is the entire safety property.
+        self._order = order
+
+    async def request_stand_down(self, timeout=15.0):
+        self.calls.append("stand_down")
+        self._order.append("peer:stand_down")
+        if self.raises:
+            raise self.raises
+        return self.ack
+
+    async def request_resume(self, timeout=15.0):
+        self.calls.append("resume")
+        self._order.append("peer:resume")
+        if self.raises:
+            raise self.raises
+
+
+@pytest.fixture
+def cluster(monkeypatch):
+    """A peer, two engines and the stored active_trader, all in memory.
+
+    The engine start/stop and the `set_active_trader` write append to ONE
+    shared list. Two lists would record that both things happened and lose the
+    only fact this file is about, which is which happened first.
+    """
+    state: dict = {"trader": "remote_vps", "order": []}
+    breakout = _Engine(running=False)
+    reversal = _Engine(running=False)
+    peer = _Peer(state["order"])
+
+    class _Svc:
+        def __init__(self, engine, name):
+            self._engine, self._name = engine, name
+
+        def get_instance(self):
+            return self
+
+        # The engine's own surface, with every lifecycle call timestamped into
+        # the shared order list.
+        @property
+        def is_running(self):
+            return self._engine.is_running
+
+        def start(self):
+            state["order"].append(f"start:{self._name}")
+            self._engine.start()
+
+        def stop(self):
+            state["order"].append(f"stop:{self._name}")
+            self._engine.stop()
+
+    # The registry, not this module: the engine table and its bulk loops live
+    # in services/engines/registry.py, so that the controller and the handover
+    # cannot drift apart about which engines exist.
+    monkeypatch.setattr(engine_registry, "_ENGINE_SERVICES", {
+        "breakout": _Svc(breakout, "breakout"),
+        "reversal": _Svc(reversal, "reversal"),
+    })
+    monkeypatch.setattr(handover._client, "get_instance", lambda: peer)
+    # This file is about a node that HAS a peer -- "both nodes are pointed at
+    # the same MT5 account", as the module docstring puts it. That was implicit
+    # until 2026-09-20, when the standalone case below was added; stating it
+    # here keeps the two apart instead of letting the real pairing config
+    # decide which set of rules these tests run under.
+    monkeypatch.setattr(handover, "_paired_host", lambda: "vps.example.com")
+
+    def _set(value, *a, **k):
+        state["order"].append(f"trader:{value}")
+        state["trader"] = value
+
+    monkeypatch.setattr(handover._node, "set_active_trader", _set)
+
+    state.update(peer=peer, breakout=breakout, reversal=reversal)
+    return state
+
+
+# ── Taking over ──────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestTakingOver:
+    async def test_the_peer_stands_down_before_this_node_starts_trading(self, cluster):
+        """The one that matters. Marking this node active first means two
+        nodes believing they own the same account."""
+        await handover.take_over_locally()
+
+        assert cluster["order"] == [
+            "peer:stand_down", "trader:local", "start:breakout", "start:reversal",
+        ]
+
+    async def test_the_engines_are_started(self, cluster):
+        await handover.take_over_locally()
+
+        assert cluster["breakout"].is_running is True
+        assert cluster["reversal"].is_running is True
+
+    async def test_a_peer_that_does_not_answer_leaves_this_node_view_only(
+        self, cluster,
+    ):
+        """Fail closed. The peer may still be trading, so this node must not
+        start — and it must not be recorded as the active trader either."""
+        cluster["peer"].raises = TimeoutError("no ack in 15s")
+
+        with pytest.raises(handover.HandoverRefused) as exc:
+            await handover.take_over_locally()
+
+        assert cluster["trader"] == "remote_vps"
+        assert cluster["order"] == ["peer:stand_down"], (
+            "nothing may follow a stand-down the peer did not acknowledge")
+        assert cluster["breakout"].is_running is False
+        assert "still the active trader" in str(exc.value)
+
+    async def test_it_says_how_many_of_the_peers_positions_keep_running(
+        self, cluster,
+    ):
+        """Standing down stops new entries; it does not close anything. An
+        operator told "the VPS stood down" will assume flat unless told."""
+        cluster["peer"].ack = {"open_positions": [{"ticket": 1}, {"ticket": 2}]}
+
+        result = await handover.take_over_locally()
+
+        assert result["remote_open_positions"] == 2
+        assert "2 of its position(s)" in result["note"]
+
+    async def test_with_no_link_it_refuses_without_asking_anything(self, cluster):
+        cluster["peer"].conn_state = "disconnected"
+
+        with pytest.raises(handover.HandoverRefused) as exc:
+            await handover.take_over_locally()
+
+        assert cluster["peer"].calls == []
+        assert cluster["order"] == []
+        assert "Pair one" in str(exc.value)
+
+
+# ── Handing back ─────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestHandingBack:
+    async def test_the_engines_stop_before_the_peer_is_asked_to_resume(self, cluster):
+        """The mirror image. Asking the peer first would have both running
+        until this node got round to stopping."""
+        cluster["breakout"].is_running = True
+        cluster["reversal"].is_running = True
+
+        await handover.hand_back_to_remote()
+
+        assert cluster["order"] == [
+            "stop:breakout", "stop:reversal", "peer:resume", "trader:remote_vps",
+        ]
+
+    async def test_a_peer_that_does_not_answer_leaves_nothing_trading(self, cluster):
+        """Engines are already stopped by then, and they stay stopped: whether
+        the peer resumed is unknown, and guessing it did is how both end up
+        running."""
+        cluster["breakout"].is_running = True
+        cluster["peer"].raises = TimeoutError("no ack in 15s")
+
+        with pytest.raises(handover.HandoverRefused) as exc:
+            await handover.hand_back_to_remote()
+
+        assert cluster["breakout"].is_running is False
+        assert cluster["trader"] == "remote_vps"
+        assert "view-only" in str(exc.value)
+        assert "may" in str(exc.value), "it must not claim the peer resumed"
+
+    async def test_it_says_how_many_local_positions_keep_running(self, cluster):
+        """Handing back closes nothing — the monitor loop keeps managing what
+        is already open. "View-only" does not mean "flat"."""
+        result = await handover.hand_back_to_remote(
+            open_trades=[{"ticket": 1}, {"ticket": 2}, {"ticket": 3}])
+
+        assert result["local_open_positions"] == 3
+        assert "3 local position(s)" in result["note"]
+
+    async def test_with_no_link_it_refuses_without_stopping_anything(self, cluster):
+        """A disconnected peer is not a reason to stop trading locally. This
+        node is the active trader and stays it."""
+        cluster["breakout"].is_running = True
+        cluster["peer"].conn_state = "disconnected"
+
+        with pytest.raises(handover.HandoverRefused):
+            await handover.hand_back_to_remote()
+
+        assert cluster["breakout"].is_running is True
+        assert cluster["peer"].calls == []
+
+
+# ── The empty slot ───────────────────────────────────────────────────────────
+# Bounce's empty slot, its fixed position and its bulk-start guard were pinned
+# here until 2026-09-28, when the slot was removed: the "positional binding"
+# they protected never crossed the wire. What replaced them -- no slot, and a
+# peer that still says "bounce" refused harmlessly -- is in
+# tests/services/engines/test_bounce_is_gone_from_the_wire.py.
+
+
+@pytest.mark.asyncio
+class TestAnInstallWithNoPeerAtAll:
+    """A standalone install must not be trapped in `remote_vps`.
+
+    Found on the owner's Mac, 2026-09-20: `active_trader` was `remote_vps`
+    with nothing paired at all -- no sync host, no token, server disabled.
+    Two things were wrong with that state at once.
+
+    It was **inert**: `open_trade`'s stand-down gate reads
+    `if _host and get_active_trader() == TRADER_REMOTE_VPS`, and with no host
+    the gate never fires, so the node traded while its own header said REMOTE.
+    A screen that contradicts what the engines are doing is the failure this
+    whole area exists to prevent.
+
+    And it was **a trap**: the only way back is Take over locally, which
+    requires a connected peer. There is no peer to connect to, so the flag
+    could not be cleared from the UI at all.
+
+    The handshake still guards the case it was written for. When a host IS
+    configured, a disconnected peer refuses exactly as before -- a peer that
+    cannot be reached might still be trading, and that is the whole point.
+    What changes is only the case where no second node exists to stand down.
+    """
+
+    async def test_taking_over_works_when_nothing_is_paired(self, cluster,
+                                                            monkeypatch):
+        monkeypatch.setattr(handover, "_paired_host", lambda: "")
+        cluster["peer"].conn_state = "disconnected"
+
+        await handover.take_over_locally()
+
+        assert cluster["trader"] == "local"
+
+    async def test_no_stand_down_is_requested_of_a_peer_that_does_not_exist(
+        self, cluster, monkeypatch,
+    ):
+        monkeypatch.setattr(handover, "_paired_host", lambda: "")
+        cluster["peer"].conn_state = "disconnected"
+
+        await handover.take_over_locally()
+
+        assert cluster["peer"].calls == []
+
+    async def test_the_engines_still_start(self, cluster, monkeypatch):
+        monkeypatch.setattr(handover, "_paired_host", lambda: "")
+        cluster["peer"].conn_state = "disconnected"
+
+        await handover.take_over_locally()
+
+        assert cluster["breakout"].is_running is True
+        assert cluster["reversal"].is_running is True
+
+    async def test_it_says_there_was_no_peer_rather_than_inventing_one(
+        self, cluster, monkeypatch,
+    ):
+        monkeypatch.setattr(handover, "_paired_host", lambda: "")
+        cluster["peer"].conn_state = "disconnected"
+
+        body = await handover.take_over_locally()
+
+        assert body["remote_open_positions"] == 0
+        assert "no remote node" in body["note"].lower()
+
+    async def test_a_configured_peer_that_is_offline_still_refuses(
+        self, cluster, monkeypatch,
+    ):
+        """The guarantee this must not weaken. A paired peer that cannot be
+        reached may still be trading the same account."""
+        monkeypatch.setattr(handover, "_paired_host", lambda: "vps.example.com")
+        cluster["peer"].conn_state = "disconnected"
+
+        with pytest.raises(handover.HandoverRefused):
+            await handover.take_over_locally()
+
+        assert cluster["trader"] == "remote_vps"
+        assert cluster["breakout"].is_running is False
+
+
+class TestReadingWhetherAPeerExists:
+    """`_paired_host` is what decides which set of rules `take_over_locally`
+    runs under, so its own failure mode matters.
+
+    It answers the SAME question `open_trade` asks before applying its
+    stand-down gate. If the two ever disagree, the flag means one thing to the
+    order path and another to the screen -- which is the bug this whole change
+    came from.
+    """
+
+    def test_it_reports_the_configured_host(self, monkeypatch):
+        monkeypatch.setattr(
+            "backend.src.services.cluster.sync.client.SyncClient.load_config",
+            staticmethod(lambda: ("vps.example.com", 8765, "tok")),
+        )
+
+        assert handover._paired_host() == "vps.example.com"
+
+    def test_no_host_configured_reads_as_standalone(self, monkeypatch):
+        monkeypatch.setattr(
+            "backend.src.services.cluster.sync.client.SyncClient.load_config",
+            staticmethod(lambda: ("", 8765, "")),
+        )
+
+        assert handover._paired_host() == ""
+
+    def test_a_config_it_cannot_read_is_treated_as_PAIRED(self, monkeypatch):
+        """Fail towards the handshake. Assuming standalone on an unreadable
+        config would skip the stand-down on a node that may well have a peer,
+        and two nodes trading one account is the outcome this file exists to
+        prevent."""
+        def _boom():
+            raise RuntimeError("database is locked")
+
+        monkeypatch.setattr(
+            "backend.src.services.cluster.sync.client.SyncClient.load_config",
+            staticmethod(_boom),
+        )
+
+        assert handover._paired_host() != ""
+
+
+# ── Taking over without the peer (owner's decision, 2026-09-25) ──────────────
+
+@pytest.mark.asyncio
+class TestTakingOverWithoutThePeer:
+    """The VPS became unreachable on 2026-09-25, and the Mac sat on REMOTE with
+    the switch disabled: a paired peer has to acknowledge a stand-down, and an
+    unreachable one never can. So nothing was trading and nothing could be
+    made to trade.
+
+    The owner chose an explicit way out. The operator confirms the VPS is not
+    trading (it is off, or its MT5 is closed), and this node takes over without
+    the handshake. It is a separate call, never a fallback inside
+    `take_over_locally`: the ordinary switch still refuses an unreachable peer
+    (TestAnInstallWithNoPeerAtAll::test_a_configured_peer_that_is_offline_still_refuses).
+    The peer is stood down when it next connects -- see
+    tests/core/test_sync_client_stands_down_the_vps_on_reconnect.py.
+    """
+
+    async def test_with_the_link_down_this_node_takes_over(self, cluster):
+        cluster["peer"].conn_state = "disconnected"
+
+        body = await handover.take_over_without_peer()
+
+        assert cluster["trader"] == "local"
+        assert body["active_trader"] == "local"
+
+    async def test_it_is_marked_active_before_its_engines_start(self, cluster):
+        cluster["peer"].conn_state = "disconnected"
+
+        await handover.take_over_without_peer()
+
+        assert cluster["order"] == ["trader:local", "start:breakout", "start:reversal"]
+
+    async def test_it_asks_nothing_of_a_peer_it_cannot_reach(self, cluster):
+        cluster["peer"].conn_state = "disconnected"
+
+        await handover.take_over_without_peer()
+
+        assert cluster["peer"].calls == []
+
+    async def test_with_the_link_up_it_refuses_and_changes_nothing(self, cluster):
+        """A reachable peer can be asked properly; skipping the handshake then
+        would be the only way two nodes end up trading."""
+        with pytest.raises(handover.HandoverRefused) as exc:
+            await handover.take_over_without_peer()
+
+        assert cluster["trader"] == "remote_vps"
+        assert cluster["order"] == []
+        assert "connected" in str(exc.value)
+
+    async def test_it_says_the_vps_will_be_stood_down_when_it_reconnects(self, cluster):
+        cluster["peer"].conn_state = "disconnected"
+
+        body = await handover.take_over_without_peer()
+
+        assert "stand down" in body["note"]
+        assert "reconnects" in body["note"]

@@ -1,0 +1,475 @@
+"""Analytics — split from core/database.py.
+Extracted from forex_trader/core/database.py -- see
+docs/todo/refactor/core-database-migration/. Verbatim port: same functions,
+same SQL, same behavior, using database.py's own db()/to_db_thread()
+machinery (unchanged, already correct -- this is a pure file-size split,
+not a connection-layer migration). Re-exported from database.py so every
+existing `db_module.<name>` call site works completely unchanged.
+"""
+import asyncio
+import json
+import logging
+import os
+import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+log = logging.getLogger(__name__)
+
+from backend.src.db.database import db, row_to_dict, to_db_thread, _schedule_coro  # noqa: E402
+from backend.src.services.cluster.sync_repo import _ensure_sync_tables  # noqa: E402
+
+# ── Performance analytics (heat map + channel scorecard) ──────────────────────
+
+def _session_for_hour(h: int) -> str:
+    """Map a UTC hour to a trading session: the one definition (bugs/057)."""
+    from backend.src.utils.sessions import session_for_hour
+    return session_for_hour(h)
+
+
+def _trade_pts(direction: str, entry: float, close: float) -> float:
+    """Signed points gained on a trade (positive = profit)."""
+    if not entry or not close:
+        return 0.0
+    return (close - entry) if (direction or "").upper() == "BUY" else (entry - close)
+
+
+def get_hourly_pnl_grid(days: int = 90) -> dict:
+    """Return {(weekday, hour): {'pnl': total, 'n': count, 'avg': avg}} from closed
+    trades over the last `days`, bucketed by UTC weekday (0=Mon) and hour.
+
+    Merges in the consolidated ledger (see consolidated_trades) as a fallback
+    for trades the OTHER paired node closed and has no local
+    vantage_simulated_trades row for — same cross-node gap/fallback pattern
+    already used by History's Trade History tab (get_consolidated_extra_maps).
+    Deduped by trade_id since every locally-closed trade already has its own
+    row in this node's own local copy of consolidated_trades too."""
+    import time as _t
+    from datetime import datetime as _dt, timezone as _tz
+    _ensure_sync_tables()
+    cutoff = _t.time() - days * 86400
+    grid: dict[tuple, dict] = {}
+    local_ids: set[str] = set()
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT close_time, net_pnl, trade_id FROM vantage_simulated_trades "
+            "WHERE status='closed' AND close_time >= ?",
+            (cutoff,),
+        ).fetchall()
+        ledger_rows = conn.execute(
+            "SELECT close_time, pnl_dollars, trade_id FROM consolidated_trades "
+            "WHERE close_time >= ?", (cutoff,),
+        ).fetchall()
+    for ct, pnl, tid in rows:
+        local_ids.add(tid)
+        if not ct:
+            continue
+        d = _dt.fromtimestamp(float(ct), tz=_tz.utc)
+        key = (d.weekday(), d.hour)
+        cell = grid.setdefault(key, {"pnl": 0.0, "n": 0})
+        cell["pnl"] += float(pnl or 0)
+        cell["n"]   += 1
+    for ct, pnl, tid in ledger_rows:
+        if tid in local_ids or not ct:
+            continue
+        d = _dt.fromtimestamp(float(ct), tz=_tz.utc)
+        key = (d.weekday(), d.hour)
+        cell = grid.setdefault(key, {"pnl": 0.0, "n": 0})
+        cell["pnl"] += float(pnl or 0)
+        cell["n"]   += 1
+    for cell in grid.values():
+        cell["avg"] = round(cell["pnl"] / cell["n"], 2) if cell["n"] else 0.0
+    return grid
+
+
+# ── Equity curve helpers ──────────────────────────────────────────────────────
+
+def get_equity_drawdown_pct(balance: Optional[float] = None) -> float:
+    """
+    Current drawdown from the peak-balance watermark as a fraction [0, 1].
+
+    `balance` is the LIVE MetaTrader balance. The watermark is app_config
+    `peak_balance` (bugs/042), set from the live balance on each close, so
+    current has to come from the same source -- the simulation ledger drifts
+    (-$2,342.65 against a $1,457.91 peak on the owner's demo DB, 2026-10-11).
+    Returns 0.0 with no balance, no watermark, or a balance at or above it.
+
+    Until 2026-10-11 this read a `vantage_simulation_account.peak_balance`
+    column that no longer exists, and the error was swallowed, so every ML
+    vector ever stored carries 0 here. No engine passes a balance yet: whether
+    they should is the owner's call (simon-handover/053).
+    """
+    if balance is None:
+        return 0.0
+    try:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT value FROM app_config WHERE key='peak_balance'"
+            ).fetchone()
+    except Exception as exc:
+        log.warning("equity drawdown: cannot read peak_balance: %s", exc)
+        return 0.0
+    peak = float(row[0] or 0) if row else 0.0
+    if peak <= 0:
+        return 0.0
+    dd = max(0.0, (peak - float(balance)) / peak)
+    return round(min(dd, 1.0), 4)
+
+
+# ── Regime detection helper ───────────────────────────────────────────────────
+
+def get_regime_score(adx: float, atr: float) -> float:
+    """
+    ADX bucket as a normalised score [0, 1]:
+      1.0  strongly trending   (ADX ≥ 40)
+      0.75 trending            (ADX 28-40)
+      0.5  mixed               (ADX 20-28)
+      0.25 weakly ranging      (ADX 14-20)
+      0.0  ranging/choppy      (ADX < 14)
+
+    `atr` is not read. It stays in the signature so the six call sites keep
+    their shape. Until 2026-10-11 an `atr_avg` argument promoted an ATR spike
+    to 0.5, but no caller ever passed it, so that branch never ran and every
+    stored `regime_score` is this ADX bucket. It was deleted rather than
+    switched on: 7,553 training vectors hold the value as written. Volatility
+    reaches the Reversal model through its own feature, `vol_regime`
+    (docs/todo/016).
+    """
+    if adx >= 40:
+        return 1.0
+    if adx >= 28:
+        return 0.75
+    if adx >= 20:
+        return 0.5
+    if adx >= 14:
+        return 0.25
+    return 0.0
+
+
+# ── AI research inputs ────────────────────────────────────────────────────────
+# Moved from frontend/pages/ai_summary.py. All three feed the AI market-research
+# prompt; none is on any trading path.
+
+def custom_strategy_blurb(strategy_id: str):
+    """First line of a custom strategy's description, or None.
+
+    Built-in strategies have hardcoded blurbs in the view; only user-defined
+    ones live in the DB.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT name, description FROM custom_strategies WHERE id=?",
+            (strategy_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return (row[1] or "").split("\n")[0].strip().lstrip("#").strip()
+
+
+def recent_tg_signals(cutoff: float) -> list[dict]:
+    """Parsed Telegram signals since `cutoff`, newest first."""
+    with db() as conn:
+        return [
+            row_to_dict(r)
+            for r in conn.execute(
+                "SELECT * FROM vantage_tg_signals WHERE parsed_at>? "
+                "ORDER BY parsed_at DESC",
+                (cutoff,),
+            ).fetchall()
+        ]
+
+
+def all_custom_strategies() -> list[dict]:
+    """Every user-defined strategy, oldest first (creation order)."""
+    with db() as conn:
+        return [
+            row_to_dict(r)
+            for r in conn.execute(
+                "SELECT id, name, description FROM custom_strategies ORDER BY created_at"
+            ).fetchall()
+        ]
+
+
+def fetch_signal_execution_lags(db_path: str) -> list:
+    """Telegram->execution latency samples for the diagnostics panel (M3
+    page drain): seconds between a signal's parsed_at and its trade's
+    open_time, newest 200, by explicit env-DB path -- same fresh connection
+    the Settings page always made."""
+    import sqlite3 as _sqlite3
+    _conn = _sqlite3.connect(db_path, check_same_thread=False)
+    _conn.row_factory = _sqlite3.Row
+    try:
+        return _conn.execute("""
+            SELECT
+                (st.open_time - ts.parsed_at) AS lag_s,
+                ts.parsed_at
+            FROM vantage_tg_signals ts
+            JOIN vantage_simulated_trades st ON ts.signal_id = st.signal_id
+            WHERE st.status IN ('open','closed')
+              AND ts.parsed_at IS NOT NULL
+              AND st.open_time IS NOT NULL
+              AND (st.open_time - ts.parsed_at) BETWEEN 0 AND 300
+            ORDER BY ts.parsed_at DESC
+            LIMIT 200
+        """).fetchall()
+    finally:
+        _conn.close()
+
+
+def fetch_realised_pnl_last_24h(cutoff: float) -> float:
+    """Sum of closed-trade P&L since cutoff (prefers the real MT5 figure) --
+    the History-tab celebration check (M3 app-shell drain)."""
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(COALESCE(mt5_profit, net_pnl, 0)), 0) "
+            "FROM vantage_simulated_trades "
+            "WHERE status='closed' AND close_time > ?",
+            (cutoff,),
+        ).fetchone()
+    return float(row[0] or 0.0)
+
+
+def edge_for_source(source: str, since: float = 0.0) -> dict:
+    """Profit factor and expectancy for one signal source.
+
+    The pair the NiceGUI Edge tab was built around, over the trades that
+    really went to MT5. A win rate on its own decides nothing: 38% with an
+    average win three times the average loss is profitable, and 60% with the
+    ratio inverted is not.
+
+    Takes a source name rather than being welded to one engine, because the
+    same query answers "does this Telegram channel have an edge" -- the
+    question the Analysis scorecard raises and cannot answer.
+
+    `profit_factor` is None, not 0.0 and not infinity, for a source that has
+    never lost: a ratio with a zero denominator does not exist yet, and 0.0
+    reads as the worst possible source. `expectancy` is None for a source with
+    no closed trades at all, because nothing is not bad.
+
+    `since` is the same close-time floor `realised_pnl_for_source` takes, so a
+    panel reset to report from a fresh start does not have its edge figures
+    quietly computed over everything before it.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) n, "
+            "  SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END) wins, "
+            "  SUM(CASE WHEN net_pnl < 0 THEN 1 ELSE 0 END) losses, "
+            "  COALESCE(SUM(CASE WHEN net_pnl > 0 THEN net_pnl ELSE 0 END), 0) gp, "
+            "  COALESCE(SUM(CASE WHEN net_pnl < 0 THEN -net_pnl ELSE 0 END), 0) gl "
+            "FROM vantage_simulated_trades "
+            "WHERE status='closed' AND tg_source=? "
+            "  AND COALESCE(close_time, 0) >= ?",
+            (source, float(since or 0.0)),
+        ).fetchone()
+
+    closed = int(row[0] or 0)
+    wins = int(row[1] or 0)
+    losses = int(row[2] or 0)
+    gross_profit = float(row[3] or 0.0)
+    gross_loss = float(row[4] or 0.0)
+
+    return {
+        "closed": closed,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / closed * 100, 1) if closed else None,
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss": round(gross_loss, 2),
+        "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss else None,
+        # Over every closed trade, breakeven ones included: leaving them out
+        # inflates the win rate and this figure together.
+        "expectancy": (round((gross_profit - gross_loss) / closed, 2)
+                       if closed else None),
+        "avg_win": round(gross_profit / wins, 2) if wins else None,
+        "avg_loss": round(gross_loss / losses, 2) if losses else None,
+    }
+
+
+def realised_pnl_for_source(source: str, since: float = 0.0) -> dict:
+    """Closed-trade count, total P&L and per-trade average for one channel.
+
+    Reads vantage_simulated_trades on purpose. An engine's own database records
+    every signal it produced and prices them all at the virtual lot, whether or
+    not the trade was ever placed; only rows here correspond to orders that
+    really went to MT5.
+
+    `since` is a close-time floor, for an engine whose panel has been reset
+    to report from a fresh start (see reversal_engine/stats_repo). 0.0 --
+    the default -- counts everything, which is what every other caller
+    wants and what this did before the parameter existed.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) n, COALESCE(SUM(net_pnl), 0) total "
+            "FROM vantage_simulated_trades "
+            "WHERE status='closed' AND tg_source=? "
+            "  AND COALESCE(close_time, 0) >= ?",
+            (source, float(since or 0.0)),
+        ).fetchone()
+    n = int(row[0] or 0)
+    total = float(row[1] or 0.0)
+    return {"n": n, "total": total, "per_trade": (total / n) if n else 0.0}
+
+
+def closed_pnls_since(close_time_from: float) -> list[float]:
+    """Every closed trade's net P&L since a timestamp, oldest first.
+
+    Keyed on CLOSE time, so a trade opened yesterday and closed today counts.
+    The risk governor replays these in order to rebuild the day's running total
+    and its high-water mark -- see day_pnl_and_peak, which deliberately
+    recomputes rather than persisting a counter that can drift.
+    """
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT net_pnl FROM vantage_simulated_trades "
+            "WHERE close_time >= ? ORDER BY close_time", (close_time_from,),
+        ).fetchall()
+    return [float(r[0] or 0.0) for r in rows]
+
+
+def _rung_index(max_tp_hit) -> int:
+    """0 for "never reached a TP", else the rung number from a "TP<n>" value.
+
+    The column carries 'none', 'n/a', '' and NULL for the same outcome (all
+    four are present in the live database), so every non-"TP<n>" value means
+    no rung. Reading any of them as a rung would overstate ladder depth, which
+    is the one number this aggregate exists to make trustworthy.
+    """
+    s = str(max_tp_hit or "").strip().upper()
+    if not s.startswith("TP"):
+        return 0
+    try:
+        return int(s[2:])
+    except ValueError:
+        return 0
+
+
+def _close_rung(direction, close_price, tps) -> int:
+    """The deepest TP the close price is at or beyond: a floor on the rung reached.
+
+    For trades whose max_tp_hit was never written (owner, 2026-10-21: 24 in
+    the demo database closed at or past TP1 with no rung, 12 of them
+    'all_tps_hit'). Price may have gone further and come back, so this can
+    only understate -- which is the safe side for a number about ladder depth.
+    """
+    if close_price is None:
+        return 0
+    buy = str(direction or "").upper() == "BUY"
+    rung = 0
+    for i, tp in enumerate(tps, start=1):
+        if tp is None:
+            break
+        if (close_price >= tp) if buy else (close_price <= tp):
+            rung = i
+    return rung
+
+
+def get_strategy_ladder_reach(days: int = 30, min_n: int = 5) -> dict[str, dict]:
+    """How far up its TP ladder each strategy's trades ACTUALLY get.
+
+    A template's configured ladder says what is reachable in principle; this
+    says what was reached in practice, which is a different quantity whenever
+    a trailing stop is armed inside the ladder. "GD VIP - Single" is the
+    worked example (2026-09-04): eight rungs at 20/40/60/80/100/120/170/270
+    pips, a trail armed at 40 pips (TP2) with a 50-pip distance, and 50 pips
+    is around 42% of a typical H1 range on XAUUSD. Over 30 days, 50 of its 85
+    closed trades topped out at TP1 or TP2, 3 reached TP5 or beyond, and one
+    completed the ladder. The AI Analysis prompt recommended it for "letting
+    profits run up the ladder" -- reasoning from the configuration, because
+    the configuration was all it was given.
+
+    `stopped_after_tp` is the truncation signature: a rung was banked and the
+    trade then exited on a stop. Those are WINS, so win rate cannot show it.
+
+    A trade with no max_tp_hit recorded is credited the rung its close price
+    reached (`_close_rung`); a recorded rung is never lowered by it.
+
+    Returns {strategy: {n, win_rate, net_pnl, no_tp, tp1_2, tp3_4, tp5_plus,
+    stopped_after_tp, top_rung, avg_rung}}, strategies under `min_n` trades
+    dropped. `avg_rung` is the mean rung reached, no-TP trades counting 0.
+    Never raises: this feeds a prompt, and a failure must cost the evidence,
+    not the analysis.
+    """
+    import time as _t
+    cutoff = _t.time() - days * 86400
+    acc: dict[str, dict] = {}
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT strategy, max_tp_hit, exit_reason, net_pnl, direction, "
+                "close_price, tp1, tp2, tp3, tp4, tp5, tp6, tp7, tp8 "
+                "FROM vantage_simulated_trades "
+                "WHERE status='closed' AND close_time >= ? AND strategy IS NOT NULL",
+                (cutoff,),
+            ).fetchall()
+    except Exception as exc:
+        log.warning("strategy ladder reach unavailable: %s", exc)
+        return {}
+
+    for strategy, max_tp_hit, exit_reason, net_pnl, direction, close_price, *tps in rows:
+        r = acc.setdefault(str(strategy), {
+            "n": 0, "wins": 0, "net_pnl": 0.0, "no_tp": 0, "tp1_2": 0,
+            "tp3_4": 0, "tp5_plus": 0, "stopped_after_tp": 0, "top_rung": 0,
+            "rung_sum": 0,
+        })
+        pnl  = float(net_pnl or 0.0)
+        rung = _rung_index(max_tp_hit) or _close_rung(direction, close_price, tps)
+        r["n"] += 1
+        r["rung_sum"] += rung
+        r["net_pnl"] += pnl
+        if pnl > 0:
+            r["wins"] += 1
+        if rung <= 0:
+            r["no_tp"] += 1
+        else:
+            r["top_rung"] = max(r["top_rung"], rung)
+            if rung <= 2:
+                r["tp1_2"] += 1
+            elif rung <= 4:
+                r["tp3_4"] += 1
+            else:
+                r["tp5_plus"] += 1
+            # Only a banked rung can be truncated -- a stop with no rung
+            # behind it is an ordinary loser, not a ladder cut short.
+            if str(exit_reason or "").upper() == "SL":
+                r["stopped_after_tp"] += 1
+
+    out: dict[str, dict] = {}
+    for strategy, r in acc.items():
+        if r["n"] < min_n:
+            continue
+        out[strategy] = {
+            "n":                r["n"],
+            "win_rate":         round(100.0 * r["wins"] / r["n"], 1),
+            "net_pnl":          round(r["net_pnl"], 2),
+            "no_tp":            r["no_tp"],
+            "tp1_2":            r["tp1_2"],
+            "tp3_4":            r["tp3_4"],
+            "tp5_plus":         r["tp5_plus"],
+            "stopped_after_tp": r["stopped_after_tp"],
+            "top_rung":         r["top_rung"],
+            "avg_rung":         round(r["rung_sum"] / r["n"], 2),
+        }
+    return out
+
+
+def realised_pnl_opened_since(open_time_from: float) -> float:
+    """Total net P&L of CLOSED trades OPENED since a timestamp.
+
+    Keyed on OPEN time, unlike closed_pnls_since above -- the trading
+    schedule's daily target counts a day's own trades, so one opened yesterday
+    and closed today belongs to yesterday. The two predicates look
+    interchangeable and are not.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(net_pnl), 0) FROM vantage_simulated_trades "
+            "WHERE status='closed' AND open_time >= ?", (open_time_from,),
+        ).fetchone()
+    return float(row[0] or 0.0)

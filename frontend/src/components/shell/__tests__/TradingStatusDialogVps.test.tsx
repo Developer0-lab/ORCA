@@ -1,0 +1,93 @@
+/**
+ * On a Mac that hands its orders to the VPS, the badge shows the VPS's status
+ * (2026-09-28: a breaker tripped on the VPS while the Mac read "Trading
+ * Active"). The dialog behind it must not then offer the Mac's own Pause or
+ * Resume: both write the Mac's database, and the Mac is not placing orders,
+ * so either button would report success and change nothing that trades.
+ */
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { TradingStatusDialog } from "../TradingStatusDialog";
+import type { TradingStatus } from "../TradingStatusDialog";
+
+const VPS_HALTED: TradingStatus = {
+  state: "halted", label: "VPS: Trading Paused until 28 Sep 14:05",
+  detail: "Circuit breaker active (3 consecutive losses)",
+  until: 1_758_000_000, resume_ts: null, can_resume: false, node: "vps",
+};
+
+beforeEach(() => {
+  vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}) })));
+});
+afterEach(() => vi.unstubAllGlobals());
+
+const show = (status: TradingStatus) =>
+  render(<TradingStatusDialog open onOpenChange={() => {}} status={status} onChanged={() => {}} />);
+
+it("shows the VPS's state and says where to act on it", () => {
+  show(VPS_HALTED);
+
+  expect(screen.getByText(VPS_HALTED.label)).toBeInTheDocument();
+  expect(screen.getByText(VPS_HALTED.detail)).toBeInTheDocument();
+  expect(screen.getByTestId("trading-status-vps-note")).toHaveTextContent(/on the VPS/i);
+});
+
+it("offers neither Pause nor Resume from this node", () => {
+  show(VPS_HALTED);
+
+  expect(screen.queryByRole("button", { name: /pause now/i })).toBeNull();
+  expect(screen.queryByRole("button", { name: /resume trading/i })).toBeNull();
+  expect(screen.queryByLabelText(/pause for/i)).toBeNull();
+});
+
+it("does the same when the VPS reports all clear", () => {
+  show({ ...VPS_HALTED, state: "ok", label: "VPS: Trading Active", detail: "", until: null });
+
+  expect(screen.queryByRole("button", { name: /pause now/i })).toBeNull();
+});
+
+/**
+ * Owner, 2026-09-29: "i should have a resume trading button on the popup as
+ * if it was local". The Resume goes to the VPS (its own route), never to this
+ * node's `/resume-all`, and only when the VPS says a Resume would change
+ * something.
+ */
+it("offers Resume when the VPS says it can, and sends it to the VPS", async () => {
+  const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ cleared: ["circuit_breaker"] }) }));
+  vi.stubGlobal("fetch", fetchMock);
+  const onChanged = vi.fn();
+  render(
+    <TradingStatusDialog open onOpenChange={() => {}} status={{ ...VPS_HALTED, can_resume_on_vps: true }} onChanged={onChanged} />,
+  );
+
+  fireEvent.click(screen.getByRole("button", { name: /resume trading/i }));
+
+  await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  const urls = fetchMock.mock.calls.map((c) => String((c as unknown[])[0]));
+  expect(urls).toContain("/api/trading/remote/resume-all");
+  expect(urls).not.toContain("/api/trading/resume-all");
+});
+
+it("still offers no Pause for the VPS", () => {
+  show({ ...VPS_HALTED, can_resume_on_vps: true });
+
+  expect(screen.queryByRole("button", { name: /pause now/i })).toBeNull();
+});
+
+/** Owner, 2026-11-12: the VPS's open-risk daily loss hold resumes from here. */
+it("offers Resume over the VPS's daily loss hold and says what it waives", async () => {
+  const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ cleared: ["daily_loss_limit"] }) }));
+  vi.stubGlobal("fetch", fetchMock);
+  show({
+    state: "daily_loss", label: "VPS: Daily Loss Limit: Entries Blocked",
+    detail: "Orders that risk more than $8.00 are refused.",
+    until: null, resume_ts: null, can_resume: false, node: "vps", can_resume_on_vps: true,
+  });
+
+  expect(screen.getByText(/open-risk daily loss check until the trading day ends/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: /resume trading/i }));
+
+  await waitFor(() =>
+    expect(fetchMock.mock.calls.map((c) => String((c as unknown[])[0])))
+      .toContain("/api/trading/remote/resume-all"));
+});

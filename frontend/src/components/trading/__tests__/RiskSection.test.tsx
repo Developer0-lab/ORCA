@@ -1,0 +1,237 @@
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { RiskSection } from "../internal/RiskSection";
+import { RISK_KEYS } from "../content/risk";
+
+/**
+ * The numbers that decide how much money a trade can lose.
+ *
+ * MOVED here from Settings on 2026-09-19, at the owner's request and with the
+ * tests that were guarding it — these assertions were written after the first
+ * React version of this screen offered four fields out of twenty-two, two of
+ * which named columns that do not exist, so they raised on save and the value
+ * was silently lost. None of that is less true for being on another tab.
+ *
+ * The endpoint did not move: `/api/settings/risk` is still where these live.
+ */
+const BODIES: Record<string, unknown> = {
+  "/api/settings/risk": {
+    risk_per_trade_pct: 1, max_risk_per_trade_pct: 2, max_open_trades: 3,
+    max_lot_size: 0.5, max_daily_loss_pct: 5, max_total_drawdown_pct: 10,
+    giveback_guard_enabled: 0, giveback_arm_usd: 50, giveback_pct: 40,
+    circuit_breaker_enabled: 1, circuit_breaker_losses: 3,
+    circuit_breaker_cooldown_mins: 60, internal_hedge_mode: "off",
+    internal_net_exposure_max_lots: 0.5, dpm_enabled: 0, profit_close_usd: 0,
+    risk_governor_enabled: 0,
+    global_harvest_enabled: 1, global_harvest_threshold_usd: 75,
+  },
+};
+
+let fetchMock: ReturnType<typeof vi.fn>;
+let overrides: Record<string, unknown>;
+
+beforeEach(() => {
+  overrides = {};
+  fetchMock = vi.fn(async (url: string) => {
+    const key = String(url);
+    const body = (overrides[key] ?? BODIES[key] ?? {}) as Record<string, unknown>;
+    const status = Number(body.__status ?? 200);
+    return { ok: status < 400, status, json: async () => body };
+  });
+  vi.stubGlobal("fetch", fetchMock);
+});
+afterEach(() => vi.unstubAllGlobals());
+
+const writes = () => fetchMock.mock.calls.filter((c) => c[1]?.method && c[1].method !== "GET");
+
+describe("risk", () => {
+  it("shows the stored numbers, under the names the column actually has", async () => {
+    // The first React version of this tab offered `risk_pct` and
+    // `daily_loss_limit_pct`. Neither is a column of vantage_risk_settings, so
+    // both raised on save and the value was silently lost while the box kept
+    // showing what was typed.
+    render(<RiskSection />);
+
+    expect(await screen.findByLabelText("Risk per trade (%)")).toHaveValue("1");
+    expect(screen.getByLabelText("Maximum open trades")).toHaveValue("3");
+    expect(screen.getByLabelText("Max daily loss (%)")).toHaveValue("5");
+  });
+
+  it("saves a field when it is left, not on every keystroke", async () => {
+    render(<RiskSection />);
+    const field = await screen.findByLabelText("Risk per trade (%)");
+
+    await userEvent.clear(field);
+    await userEvent.type(field, "2");
+    expect(writes()).toHaveLength(0);
+
+    await userEvent.tab();
+
+    await waitFor(() => expect(writes()).toHaveLength(1));
+    expect(JSON.parse(writes()[0][1].body)).toEqual({ risk_per_trade_pct: 2 });
+  });
+
+  it("adopts the value the backend stored, not the one that was typed", async () => {
+    // The risk service clamps. A field that kept the operator's number would
+    // tell them the engine is using a value it is not.
+    overrides["/api/settings/risk"] = {
+      ...BODIES["/api/settings/risk"] as object, risk_per_trade_pct: 2,
+    };
+    render(<RiskSection />);
+    const field = await screen.findByLabelText("Risk per trade (%)");
+
+    await userEvent.clear(field);
+    await userEvent.type(field, "99");
+    await userEvent.tab();
+
+    await waitFor(() => expect(field).toHaveValue("2"));
+  });
+
+  it("says these decide how much a trade can lose", async () => {
+    render(<RiskSection />);
+
+    expect(await screen.findByText(/how much a single trade can lose/)).toBeInTheDocument();
+  });
+
+  it("offers every setting the store has a column for, not four of them", async () => {
+    // The tab shipped with 4 fields where the NiceGUI page had 22. An operator
+    // cannot set a give-back limit, a circuit breaker or an exposure cap from a
+    // screen that does not show them.
+    render(<RiskSection />);
+    await screen.findByLabelText("Risk per trade (%)");
+
+    for (const key of RISK_KEYS) {
+      expect(screen.getByTestId(`risk-${key}`)).toBeInTheDocument();
+    }
+    expect(RISK_KEYS.length).toBeGreaterThanOrEqual(20);
+  });
+
+  it("saves a toggle as the 0/1 the column holds", async () => {
+    render(<RiskSection />);
+
+    await userEvent.click(await screen.findByLabelText("Risk governor"));
+
+    await waitFor(() => expect(writes()).toHaveLength(1));
+    expect(JSON.parse(writes()[0][1].body)).toEqual({ risk_governor_enabled: 1 });
+  });
+
+  it("saves the hedging mode as the string the column holds", async () => {
+    render(<RiskSection />);
+
+    await userEvent.selectOptions(await screen.findByLabelText("Hedging"), "net_exposure");
+
+    await waitFor(() => expect(writes()).toHaveLength(1));
+    expect(JSON.parse(writes()[0][1].body)).toEqual({ internal_hedge_mode: "net_exposure" });
+  });
+
+  it("offers never adding to a loser and counting open risk, both off", async () => {
+    // docs/todo/026 (owner, 2026-10-22). Both refuse real orders when on, so
+    // they arrive off, and each write names its own column.
+    render(<RiskSection />);
+    await screen.findByLabelText("Risk per trade (%)");
+
+    const loser = screen.getByLabelText("Never add to a loser");
+    const openRisk = screen.getByLabelText("Count open risk toward the daily loss limit");
+    expect(loser).not.toBeChecked();
+    expect(openRisk).not.toBeChecked();
+    expect(within(screen.getByTestId("risk-daily_limit_counts_open_risk"))
+      .getAllByText(/Same limit, same day and same Resume as Max daily loss/).length).toBeGreaterThan(0);
+
+    await userEvent.click(loser);
+    await waitFor(() => expect(writes()).toHaveLength(1));
+    expect(JSON.parse(writes()[0][1].body)).toEqual({ never_add_to_loser_enabled: 1 });
+  });
+
+  it("says when a setting does nothing because its switch is off", async () => {
+    // "I turned it on and it made no difference" is how a setting gets
+    // reported as broken.
+    render(<RiskSection />);
+    await screen.findByLabelText("Risk per trade (%)");
+
+    expect(within(screen.getByTestId("risk-giveback_arm_usd"))
+      .getByText(/Does nothing until the give-back guard is on/)).toBeInTheDocument();
+  });
+
+  it("stops saying so once the switch is on", async () => {
+    // Negative control: a note shown always is a note nobody reads.
+    overrides["/api/settings/risk"] = {
+      ...BODIES["/api/settings/risk"] as object, giveback_guard_enabled: 1,
+    };
+    render(<RiskSection />);
+    await screen.findByLabelText("Risk per trade (%)");
+
+    expect(within(screen.getByTestId("risk-giveback_arm_usd"))
+      .queryByText(/Does nothing until/)).not.toBeInTheDocument();
+  });
+});
+
+/**
+ * Global harvest — the EA-side setting that had no control at all.
+ *
+ * `global_harvest_enabled` / `global_harvest_threshold_usd` were a toggle and a
+ * number on the NiceGUI Trading tab (`_strategy_cards.py:385-441`), dropped by
+ * the React port (4da2526) and never rebuilt. Nothing in the port's own gap
+ * list mentioned them.
+ *
+ * They are not cosmetic. `ea_bridge.set_global_config` pushes the pair to the
+ * EA, whose `CheckGlobalHarvest()` runs on EVERY tick against EVERY open
+ * position on the symbol and closes them on aggregate floating profit. On this
+ * install it was found live, on, at $75 — a setting closing real positions
+ * that the operator could not see, let alone change.
+ */
+describe("global harvest", () => {
+  it("offers the switch and the threshold, showing what is stored", async () => {
+    render(<RiskSection />);
+    await screen.findByLabelText("Risk per trade (%)");
+
+    expect(screen.getByLabelText("Harvest open trades at a combined profit")).toBeChecked();
+    expect(screen.getByLabelText("Combined profit to harvest at ($)")).toHaveValue("75");
+  });
+
+  it("saves the threshold as a number when the field is left", async () => {
+    render(<RiskSection />);
+    const field = await screen.findByLabelText("Combined profit to harvest at ($)");
+
+    await userEvent.clear(field);
+    await userEvent.type(field, "150");
+    await userEvent.tab();
+
+    await waitFor(() => expect(writes()).toHaveLength(1));
+    expect(JSON.parse(writes()[0][1].body)).toEqual({ global_harvest_threshold_usd: 150 });
+  });
+
+  it("saves the switch as the 0/1 the column holds", async () => {
+    render(<RiskSection />);
+
+    await userEvent.click(
+      await screen.findByLabelText("Harvest open trades at a combined profit"));
+
+    await waitFor(() => expect(writes()).toHaveLength(1));
+    expect(JSON.parse(writes()[0][1].body)).toEqual({ global_harvest_enabled: 0 });
+  });
+
+  it("says the threshold does nothing while the switch is off", async () => {
+    // The failure this screen exists to prevent: a threshold that looks set
+    // and a switch that is off look identical once the control is missing.
+    overrides["/api/settings/risk"] = {
+      ...BODIES["/api/settings/risk"] as object, global_harvest_enabled: 0,
+    };
+    render(<RiskSection />);
+    await screen.findByLabelText("Risk per trade (%)");
+
+    expect(within(screen.getByTestId("risk-global_harvest_threshold_usd"))
+      .getByText(/Does nothing until/)).toBeInTheDocument();
+  });
+
+  it("keeps it distinct from the per-trade close, which is a different thing", async () => {
+    // `profit_close_usd` closes ONE trade that is far enough ahead on its own.
+    // Global harvest closes EVERY open position once they are COMBINED far
+    // enough ahead. Two screens' worth of confusion if they read alike.
+    render(<RiskSection />);
+    await screen.findByLabelText("Risk per trade (%)");
+
+    expect(screen.getByLabelText("Close at profit ($)")).toBeInTheDocument();
+    expect(screen.getByLabelText("Combined profit to harvest at ($)")).toBeInTheDocument();
+  });
+});

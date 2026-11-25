@@ -1,0 +1,238 @@
+import { useCallback, useMemo } from "react";
+import { api } from "@/api/client";
+import { usePoll } from "@/hooks/usePoll";
+import { asArray, asObject } from "@/lib/asArray";
+import type { HaltState, Trade } from "@/api/types";
+import type { ChannelLossCapState } from "../internal/ChannelLossCapCard";
+
+interface ScheduleState {
+  schedule: Record<string, unknown>;
+  enabled: boolean;
+  daily_target: number;
+  daily_state: Record<string, unknown>;
+  clock: Record<string, unknown>;
+  markets: Record<string, unknown>;
+  override_options: { value: string; label: string }[];
+  channels: string[];
+  channel_loss_cap?: ChannelLossCapState | null;
+}
+
+interface TemplatesState {
+  templates: Record<string, unknown>[];
+  builtin: string;
+  ea_connected: boolean;
+  ea_last_seen_secs: number | null;
+}
+
+/**
+ * May a manual order be placed right now, and if not, why not.
+ *
+ * Exported on 2026-09-28 so the Chart tab's Market/Limit order buttons
+ * (through useOrderGate) ask the same question the same way. Two copies
+ * of this would drift, and a button that is enabled on one tab and not the
+ * other is worse than either answer.
+ *
+ * The answer comes from what the backend said. It is never a decision made
+ * here: the backend still refuses anything it will not place.
+ */
+export function orderDisabledReason(h: HaltState | null, error: Error | null): string | null {
+  if (!h) return error ? "Trading status is unknown — the app cannot reach the backend." : null;
+  if (h.reason) return h.reason;
+  if (h.market_closed) return "The market is closed for the week.";
+  const breaker = h.circuit_breaker;
+  // `is_active` is the authoritative field and always has been. This read
+  // `tripped`, a key the repo has never returned, so a tripped breaker left
+  // Execute ENABLED with no explanation: the backend refused the order and
+  // the operator found out by pressing the button.
+  if (breaker && breaker["is_active"] === true) {
+    const mins = Math.ceil(Number(breaker["remaining_secs"] ?? 0) / 60);
+    const losses = Number(breaker["consec_losses"] ?? 0);
+    return (
+      "The circuit breaker has tripped" +
+      (losses ? ` after ${losses} consecutive losing trades` : "") +
+      (mins > 0 ? `. Live trading resumes in about ${mins} min.` : ".")
+    );
+  }
+  return null;
+}
+
+/**
+ * May a manual Market or Limit order be placed right now, and if not, why not.
+ *
+ * Narrower than `orderDisabledReason` on purpose: a manual order sits outside
+ * the daily pause and any other paused trading, so a halt reason or a tripped
+ * breaker does not grey it. Limit since 2026-10-05; Market since 2026-10-07
+ * (owner: "a market or limit order can bypass any paused trading"). That
+ * matches the backend: `manual_limit_order` checks neither, `open_trade`
+ * skips both for the dialog's "manual_market" source, and
+ * `resting_revalidation` leaves channel "Manual" orders on the book through a
+ * pause. A closed market and an unreachable backend still stop it.
+ */
+export function manualOrderDisabledReason(h: HaltState | null, error: Error | null): string | null {
+  if (!h) return error ? "Trading status is unknown — the app cannot reach the backend." : null;
+  if (h.market_closed) return "The market is closed for the week.";
+  return null;
+}
+
+/**
+ * The Trading tab's reads, and the one question every control on it asks:
+ * **may this act right now, and if not, why not?**
+ *
+ * `disabledReason` is computed from what the backend said — a halt reason, a
+ * closed market, a tripped breaker, a bridge that is not connected. It is
+ * never a decision made here. The page renders the answer; the backend decides
+ * it, and duplicating a risk check in the UI produces two answers that drift.
+ */
+export function useTradingController() {
+  const trades = usePoll<Trade[]>(
+    "trading/trades",
+    useCallback(() => api.get<Trade[]>("/api/trading/trades"), []),
+    5_000,
+  );
+
+  const halt = usePoll<HaltState>(
+    "trading/halt",
+    useCallback(() => api.get<HaltState>("/api/trading/halt"), []),
+    5_000,
+  );
+
+  const signals = usePoll<Record<string, unknown>[]>(
+    "trading/signals",
+    useCallback(() => api.get<Record<string, unknown>[]>("/api/trading/signals"), []),
+    10_000,
+  );
+
+  const schedule = usePoll<ScheduleState>(
+    "schedule/state",
+    useCallback(() => api.get<ScheduleState>("/api/schedule/state"), []),
+    10_000,
+  );
+
+  const templates = usePoll<TemplatesState>(
+    "trading/templates",
+    useCallback(() => api.get<TemplatesState>("/api/trading/templates"), []),
+    10_000,
+  );
+
+  // The rule itself is `orderDisabledReason` above, shared with the Chart
+  // tab's order buttons through useOrderGate.
+  const disabledReason = useMemo(
+    () => orderDisabledReason(halt.data, halt.error),
+    [halt.data, halt.error],
+  );
+  const manualDisabledReason = useMemo(
+    () => manualOrderDisabledReason(halt.data, halt.error),
+    [halt.data, halt.error],
+  );
+
+  const refreshAll = useCallback(async () => {
+    await Promise.all([trades.refresh(), halt.refresh(), signals.refresh()]);
+  }, [trades, halt, signals]);
+
+  // ── Schedule ──────────────────────────────────────────────────────────────
+
+  const setScheduleEnabled = useCallback(async (enabled: boolean) => {
+    await api.put("/api/schedule/enabled", { enabled });
+    await schedule.refresh();
+  }, [schedule]);
+
+  const setSchedule = useCallback(async (next: Record<string, unknown>) => {
+    await api.put("/api/schedule/schedule", { schedule: next });
+    await schedule.refresh();
+  }, [schedule]);
+
+  const setDailyTarget = useCallback(async (target: number) => {
+    await api.put("/api/schedule/daily-target", { target });
+    await schedule.refresh();
+  }, [schedule]);
+
+  const resumeToday = useCallback(async () => {
+    await api.post("/api/schedule/resume-today");
+    await schedule.refresh();
+  }, [schedule]);
+
+  const setMarket = useCallback(async (market: string, enabled: boolean) => {
+    await api.put("/api/schedule/markets", { markets: { [market]: enabled } });
+    await schedule.refresh();
+  }, [schedule]);
+
+  // `null` is the machine's own clock, and is sent as null rather than
+  // omitted: the endpoint treats a missing value the same way, but being
+  // explicit is what stops a future caller passing 0 and meaning "machine".
+  const setClockOffset = useCallback(async (minutes: number | null) => {
+    await api.put("/api/schedule/clock-offset", { minutes });
+    await schedule.refresh();
+  }, [schedule]);
+
+  const setChannelLossCaps = useCallback(
+    async (defaultCap: number, overrides: Record<string, number>) => {
+      await api.put("/api/channel-loss-cap", { default_cap: defaultCap, overrides });
+      await schedule.refresh();
+    }, [schedule]);
+
+  // ── EA templates ──────────────────────────────────────────────────────────
+
+  const saveTemplate = useCallback(
+    async (name: string, values: Record<string, unknown>) => {
+      const body = await api.put<{ pushed: boolean }>(
+        `/api/trading/templates/${encodeURIComponent(name)}`, values);
+      await templates.refresh();
+      return { pushed: body.pushed === true };
+    },
+    [templates],
+  );
+
+  const deleteTemplate = useCallback(async (name: string) => {
+    await api.del(`/api/trading/templates/${encodeURIComponent(name)}`);
+    await templates.refresh();
+  }, [templates]);
+
+  /**
+   * Rename a template. The backend repoints every live reference to it — the
+   * trading schedule, channel assignments, the AI's recommendation and the
+   * global strategy — and reports what it moved; the error is left to
+   * propagate so the dialog can show the refusal instead of closing on it.
+   */
+  const renameTemplate = useCallback(
+    async (from: string, to: string) => {
+      const body = await api.post<{ repointed: Record<string, number> }>(
+        `/api/trading/templates/${encodeURIComponent(from)}/rename`,
+        { name: to });
+      await templates.refresh();
+      return { repointed: body?.repointed ?? {} };
+    },
+    [templates],
+  );
+
+  const installBuiltin = useCallback(async () => {
+    await api.post("/api/trading/templates/install-builtin");
+    await templates.refresh();
+  }, [templates]);
+
+  // The import POST is TemplateTransfer's own -- it needs the file's text and
+  // reports its own added/replaced/skipped -- so this is the reload half only.
+  const refreshTemplates = useCallback(async () => {
+    await templates.refresh();
+  }, [templates]);
+
+  return useMemo(
+    () => ({
+      trades, halt, signals, disabledReason, manualDisabledReason, refreshAll,
+      schedule: schedule.data,
+      setScheduleEnabled, setSchedule, setDailyTarget, resumeToday,
+      setMarket, setClockOffset, setChannelLossCaps,
+      templates: asArray<Record<string, unknown>>(templates.data?.templates),
+      eaConnected: asObject(templates.data)["ea_connected"] === true,
+      eaLastSeen: typeof templates.data?.ea_last_seen_secs === "number"
+        ? templates.data.ea_last_seen_secs
+        : null,
+      saveTemplate, deleteTemplate, renameTemplate, installBuiltin,
+      refreshTemplates,
+    }),
+    [trades, halt, signals, disabledReason, manualDisabledReason, refreshAll, schedule.data,
+     setScheduleEnabled, setSchedule, setDailyTarget, resumeToday,
+     setMarket, setClockOffset, setChannelLossCaps,
+     templates.data, saveTemplate, deleteTemplate, renameTemplate,
+     installBuiltin, refreshTemplates],
+  );
+}

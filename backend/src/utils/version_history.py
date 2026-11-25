@@ -1,0 +1,564 @@
+# Version history — single source of truth for the app version number.
+# The first entry is always the current release.  __init__.py derives
+# __version__ from it and writes forex_trader/VERSION so all other
+# consumers (remote client, admin console, title banner) stay in sync.
+#
+# Each entry: (version_str, title, badge_colour, badge_label, [changes])
+
+RELEASES: list[tuple] = [
+    (
+        "v0.616",
+        "Bug fixes, security enhancements and general improvements",
+        "blue",
+        "",
+        [
+            "Bug fixes: MT5 times are read on the broker's real clock, which "
+            "moved to UTC+2 on 1 November, so closes in the first hour of the "
+            "UTC day are filed under the right day and count towards the daily "
+            "goal, which could otherwise halt trading late.",
+            "Bug fixes: the app's launcher no longer runs pip on every start "
+            "and prefers ready-built packages, so a new package release that "
+            "needs a compiler cannot stop the app coming back after a restart.",
+            "Bug fixes: the Reversal Engine reads silver, platinum, the dollar "
+            "index, the S&P, VIX and oil live and by your broker's own symbol "
+            "names, and measures again the days stored without them. The "
+            "nightly research study now runs on the node that trades, which "
+            "fills the Dashboard's Fill cost card.",
+            "Security enhancements: the dashboard's build and test tools "
+            "(Vite, Vitest and source-map-js) are updated to close all five "
+            "open Dependabot alerts. They are developer tools that do not ship "
+            "in the app, and the dashboard itself is unchanged.",
+            "Security enhancements: the app and Windows setup check PortableGit "
+            "against its pinned SHA-256 before running it, and Windows setup "
+            "forces TLS 1.2 for its downloads.",
+            "General improvements: two new Risk switches, both off by default: "
+            "never add to a losing trade (also refused while a same-direction "
+            "order is in flight), and count open risk toward the daily loss "
+            "limit.",
+            "General improvements: Settings > Remote can merge ML training data "
+            "between the Mac and the VPS (both need this version). A node only "
+            "learns from the other's history if that scores at least as well "
+            "on its newest rows. The app also installs its own git on Windows "
+            "when a machine has none, so it can update itself.",
+        ],
+    ),
+    (
+        "v0.615",
+        "Analytics, more AI providers and news on the charts",
+        "blue",
+        "",
+        [
+            "News on the charts: a NEWS button on the Dashboard chart and the "
+            "Chart tab's Broker chart marks every bar a high, medium or low "
+            "impact release fell in, coloured by impact. Hover a marked candle "
+            "for the releases, their forecast and previous, and how far price "
+            "moved in the half hour after. Low impact starts from this week.",
+            "Analytics: each closed trade's worst and best excursion (MAE and "
+            "MFE) and how much of the move it kept; a Monte Carlo risk tab "
+            "that replays your own trades 5,000 times for drawdown odds; and "
+            "gold positioning on the News tab (CFTC managed money and GLD "
+            "holdings).",
+            "AI providers: OpenAI, Gemini, xAI, Mistral and OpenRouter join "
+            "Claude and DeepSeek. Choosing a provider in Settings > AI now "
+            "takes effect; before, the choice was saved under a name nothing "
+            "read.",
+            "VPS: when the VPS is generating signals, the Breakout, Reversal, "
+            "Brain and Trend PA panels on the Mac show the VPS's engines, "
+            "headless VPS included, and the link to the VPS no longer drops "
+            "every 30 seconds once the trade ledger passes 1 MB.",
+            "Bug fixes: About > Version history shows every release again "
+            "(it showed a dash and no notes), Ladder Reach shows the rung each "
+            "trade reached instead of a dash, the compound calculator's goal "
+            "and drawdown go to 100%, and a missing broker clock offset is "
+            "logged once an hour instead of every 30 seconds.",
+        ],
+    ),
+    (
+        "v0.614",
+        "Bug fixes, calendar improvements and ML improvements",
+        "blue",
+        "",
+        [
+            "Bug fixes: the MT5 bridge no longer restarts in a loop when the "
+            "broker stops answering tick-history reads, sends those reads one "
+            "at a time, and remembers the pause across app restarts, so the "
+            "bridge no longer needs restarting by hand after the app does.",
+            "Bug fixes: Breakout reads closed candles and both engines read "
+            "bar times in true UTC; a Breakout BUY is charged the spread once "
+            "and its break-even stop sits at true break-even; Set & Forget "
+            "confirmations, signal entry checks and AI validation are "
+            "corrected.",
+            "Bug fixes: the Mac keeps its own settings when it reconnects to "
+            "the VPS, a Reversal Engine trade shows the strategy it really "
+            "ran under and is graded on its own targets, the EA's closes read "
+            "\"EA TP\" or \"EA close\" instead of \"Manual\", and an "
+            "all-winners window says \"No losses\" instead of a red 0.00.",
+            "Bug fixes: the daily AI analysis no longer fails on every closed "
+            "trade, the remote client never scans a hosting provider's "
+            "network, the evidence collector no longer pins a CPU core, and "
+            "the goal-paused dialog offers \"Resume anyway\". The Bounce "
+            "engine is removed.",
+            "Calendar improvements: % gain on every day, week, month and "
+            "year; each trade's strategy in the day view; $, %, pips or R in "
+            "the cells; profit factor, averages, best, worst, fees, drawdown "
+            "and the day's P&L curve; streaks and weekday totals; a year "
+            "view; and markers for the daily goal, the loss limit and news.",
+            "Calendar improvements: a journal for each trading day (a note, "
+            "tags and a 1-5 mood), kept separately for demo and live. News "
+            "is now kept as it is fetched, so news markers start from this "
+            "release.",
+            "ML improvements, all off by default: training weighted by age, "
+            "learning from executed trades, Breakout learning realised R "
+            "with an accuracy gate, and its switches on the Breakout tab. "
+            "\"Is it learning?\" plots realised R and says what each model "
+            "learns from. Research added (session-drift trials) found no "
+            "edge, and is recorded as such.",
+        ],
+    ),
+    (
+        "v0.613",
+        "Security, bug fixes and app improvements",
+        "blue",
+        "",
+        [
+            "Security: GitHub workflows run with read-only repository "
+            "permissions, test servers require TLS 1.2 or newer, temporary "
+            "files are created safely, the admin console's page is never "
+            "cached by the browser, and a request carrying a NaN value is "
+            "refused cleanly instead of failing on the server.",
+            "Security: Settings > Update sets aside any uncommitted edits in "
+            "git stash before it updates, instead of discarding them.",
+            "Bug fixes: the daily goal and daily loss limit count the Trading "
+            "Clock's day, a goal already reached survives Resume, and a "
+            "profit target follows the running total so a loss below it "
+            "re-opens trading.",
+            "Bug fixes: a trading pause stops the limit and resting-order "
+            "routes too, a refused close retries under the other filling "
+            "modes, a channel's break-even move never loosens a stop, and "
+            "gross and realised P&L follow the broker's figure.",
+            "Bug fixes: two dashboard reads no longer stall the trading loop, "
+            "a changed daily loss limit shows on the Dashboard at once, a "
+            "price typed with a trailing full stop is read, and tick times "
+            "are read in true UTC.",
+            "Improvements: an optional contradiction review between signal "
+            "sources, an optional H1 regime for Auto templates, and optional "
+            "volatility inputs for the Reversal engine, all off by default.",
+            "Improvements: the daily goal can move open trades to break even, "
+            "the dashboard's performance cards have 1D/1W/30D/All, the Broker "
+            "chart scrolls back, a Feedback button, losing days in the "
+            "Compound Calculator, and fixes to ORB, Trend PA and Set & Forget "
+            "found by replaying them on real gold.",
+        ],
+    ),
+    (
+        "v0.612",
+        "The VPS trades Telegram itself",
+        "blue",
+        "",
+        [
+            "When the VPS is the active node it now reads, parses and trades "
+            "the Telegram signals itself, nearest the broker, instead of "
+            "waiting for the Mac. The Mac still sets the parsing and risk "
+            "settings, and keeps showing the signals for display only: no "
+            "trades, no alerts.",
+            "The Signal Generator engines (Breakout, Reversal, Trend PA) run "
+            "on whichever node is trading. With centralized generation off "
+            "they had stopped generating anywhere; that switch now covers the "
+            "engines only.",
+            "The Mac's Telegram channels, per-channel parser settings and "
+            "Logic Keywords reach the VPS on connect and on every change, "
+            "like the EA templates. Settings > Remote node shows whether the "
+            "VPS took them, and names any channel it could not listen to. "
+            "A channel paused by hand and the news blackout go with them.",
+            "A paused channel no longer fires instant entries (it only "
+            "stopped full signals before).",
+            "Risk % sizing on an EA template: a queued or engine trade is "
+            "now sized from the template's own stop, the one the order is "
+            "sent with. It was sized from the signal's stop, so one Risk % "
+            "gave anything from 0.02 to 0.07 lots and put roughly 1% to 5% "
+            "at risk.",
+            "Pairing: every setting except the per-machine ones syncs between "
+            "the nodes, the VPS follows the Mac's MT5 accounts and demo/live "
+            "choice, and EA templates sync to the VPS (an order naming a "
+            "missing template is refused). Restart, upgrade and resume "
+            "trading on the VPS, close a VPS position and start its engines "
+            "from the Mac, and see whether both nodes run the same commit, "
+            "and why not.",
+            "The Mac can take over trading when the paired VPS cannot be "
+            "reached, and a headless VPS now restarts properly after an "
+            "upgrade.",
+            "New Trend PA engine, a daily profit goal, and a per-channel "
+            "daily loss cap (off by default). The Bounce engine is gone from "
+            "every channel list.",
+            "Orders: Max Open Trades counts only live trades, open trades are "
+            "counted from the broker, an EA, MT5 or VPS rejection is reported "
+            "as a refusal, and a placeholder whose order MT5 still holds is "
+            "no longer written off. MT5 AutoTrading is switched back on (with "
+            "an alert) when found off.",
+            "Dashboard: the brain (a live map of every entry decision), fill "
+            "costs, a daily GLD GEX snapshot, a Chart tab with drawings, a "
+            "TradingView view, order buttons and a position tool, a Compound "
+            "Calculator, and the Analysis Spread and Cost columns filled "
+            "again.",
+            "Settings: a Latency view showing where a signal's time goes, hop "
+            "by hop; a Restart bridge button on the MT5 tab; AI tuning "
+            "changes recorded as experiments that need owner approval.",
+            "Windows: the installer fetches the app from GitHub, the latest "
+            "EA is installed at startup, the bridge finds and logs in to the "
+            "MT5 terminal, and a startup crash-loop is fixed.",
+        ],
+    ),
+    (
+        "v0.611",
+        "Windows install and VPS setup",
+        "blue",
+        "",
+        [
+            "The Windows installer now installs the Microsoft Visual C++ "
+            "Redistributable. Without it a fresh machine could not load "
+            "LightGBM and the app crashed on every start.",
+            "A Windows install now links itself to GitHub, so Settings > "
+            "Update can check for and apply updates and the admin console "
+            "shows its commit. An install left broken by an earlier attempt "
+            "repairs itself on the next start.",
+            "Settings > Remote node has a Make this node a VPS button: one "
+            "press creates the pairing token, opens the sync port in the "
+            "Windows firewall (with the normal permission prompt) and starts "
+            "listening. Stop being a VPS undoes it. A PC used as a main "
+            "machine no longer has any port opened by the installer.",
+            "On a VPS the tab shows the address and port to enter on the "
+            "other machine, whether the firewall lets it in, and what "
+            "secures the link.",
+            "The first start after an install opens the dashboard in the "
+            "browser, including on a VPS.",
+        ],
+    ),
+    (
+        "v0.61",
+        "Stall fixes and a quieter log",
+        "blue",
+        "",
+        [
+            "Backtests, the ORB chart and the Reversal Engine's batch "
+            "retrain no longer block the event loop: a backtest run could "
+            "freeze trade management for up to 86 seconds with no position "
+            "monitor, EA link or Telegram running. All three now run on "
+            "worker threads. A stall sampler now names the blocking line "
+            "when one happens.",
+            "The Telegram bot token no longer appears in the local log "
+            "file, which Export Logs sends by email. Every log record is "
+            "scrubbed at the handler, not just the diagnostics upload.",
+            "A new report (tools/order_latency_report.py) reads MetaTrader's "
+            "own daily logs to measure broker execution time per trade "
+            "server, for diagnosing slow fills without touching a broker.",
+            "The owner's private notes (docs/simon-handover, docs/todo, "
+            "docs/reviews) moved out of this public repo into a private "
+            "one, attached back at the same paths.",
+        ],
+    ),
+    (
+        "v0.6",
+        "React Frontend Migration",
+        "blue",
+        "",
+        [
+            "New dashboard. The NiceGUI screens are replaced by a React app "
+            "over a new HTTP API, and every tab has been ported. It opens on "
+            "a Dashboard page that shows what is happening now, and adds a "
+            "light and dark theme, a trading-status badge in the title bar, "
+            "a Schedule screen, fair-value gaps on the chart, and a candle "
+            "chart for each day in Analysis.",
+            "Demo/live switch: one database per MT5 account, and switching "
+            "now moves MetaTrader 5 as well as the database and config.",
+            "Only trade with the trend: an optional gate (off by default) "
+            "that every order route honours. When the trend turns, it "
+            "withdraws resting orders, and it re-checks queued signals "
+            "before they execute.",
+            "Limit orders rest at the broker and the EA template manages "
+            "the fill. Immediate Market Entry is one global setting, and a "
+            "template's own stop and anchor lot are used as written.",
+            "Reversal Engine: a measurement and gating layer (every switch "
+            "off by default), macro context (DXY, yields, VIX, gold "
+            "volatility), a nightly research study, AI tuning of its "
+            "switches (off by default), and its ML model is handed over on "
+            "an upgrade instead of discarded.",
+            "Reversal Engine ML: the meta-labeller is now trained every day. "
+            "The Signal Generator tab shows whether the engine's win rate "
+            "beats what its stop and target alone would give by chance, "
+            "and charts silver, platinum, the dollar, USDJPY, the S&P 500, "
+            "VIX and oil against gold. A new switch (off) feeds those "
+            "markets to the meta-labeller.",
+            "Backtests run EA templates tick by tick, fill at the edge of "
+            "a zone, and report their two halves separately.",
+            "Telegram: a record of what the app decided for each signal, "
+            "a study of sources calling opposite directions, and "
+            "event-window and stale-release guards, all off by default.",
+            "Set & Forget with the 30-minute trigger, a real editor for EA "
+            "templates (with renaming), the Breakout engine's own panel, "
+            "DPM Analysis, the AI page and Export Logs.",
+            "The Mac now recognises trades the VPS opened. The Remote tab "
+            "shows the VPS's health, and each account can have its own "
+            "MT5 terminal path.",
+            "Only one copy of the app can run at a time, even across two "
+            "checkouts. Boot starts MT5 on a Mac, and the watchdog no "
+            "longer restarts the other checkout's app.",
+            "Open source: the repo is public under AGPL-3.0. A fresh "
+            "install from GitHub runs without asking for licence "
+            "approval, and can no longer update itself into the old app.",
+            "Removed: the Bounce engine, and Out of Hours from "
+            "Trading > Strategy.",
+            "Security: the Telegram bot token no longer leaves the machine "
+            "in a diagnostics upload.",
+        ],
+    ),
+    (
+        "v0.5",
+        "Refactor",
+        "purple",
+        "",
+        [
+            "Windows is now a supported client platform. The test suite runs "
+            "green on Windows CI for the first time; four defects it found "
+            "were invisible on macOS.",
+            "Security: the MT5 bridge credentials file (which holds the "
+            "broker password in plaintext), the private CA key, the "
+            "credentials encryption key and the licence file are now "
+            "restricted to the owning account on Windows via an ACL. "
+            "os.chmod does not restrict a file on Windows, so all four were "
+            "readable by any local account there.",
+            "Security: the licence/admin channel is authenticated. It was "
+            "encrypted but unauthenticated -- the licence token, machine id "
+            "and hostname were sent before the peer was established. The "
+            "internet path now verifies against a private certificate "
+            "authority shipped in the build; the LAN path pins on first use.",
+            "Fixed Telegram approval issuing empty licence keys. One of the "
+            "two registration paths never stored the machine id the licence "
+            "is signed for, so approving a request succeeded and delivered "
+            "nothing -- the client stayed on the activation screen and "
+            "re-requested for ever.",
+            "The activation screen can now approve a registration from "
+            "Telegram. It runs before the app is licensed, so nothing was "
+            "polling for the button press; a restricted poller now serves "
+            "registration approvals there and nothing else.",
+            "Fixed the Windows bridge watchdog being unable to see processes "
+            "at all, so it could never restart a dead bridge.",
+            "Fixed the test suite making live, billed calls to the DeepSeek "
+            "API on every run, and reading the developer's own OS keychain.",
+            "MT5 Bridge Control reported a running bridge as 'NOT running' "
+            "when the bridge URL used any port other than 9000 -- and would "
+            "have started a second bridge against the same terminal.",
+            "The Getting Started checklist's Telegram row could never be "
+            "ticked; the checklist no longer appears once everything is done.",
+            "Removed: the Bounce generator, TP HIT parsing, and the "
+            "win-rate figures beside each channel's strategy picker.",
+            "Internal: five of seven module-boundary contracts are now "
+            "enforced at zero, no source file exceeds its size ceiling, and "
+            "the cluster code went from no tests to 84% covered. Several "
+            "guardrails that had been reporting success while checking "
+            "nothing were found and repaired.",
+        ],
+    ),
+    (
+        "v0.42",
+        "ORB Auto-Execute Fix, R:R Tracking & Version Reporting",
+        "teal",
+        "",
+        [
+            "Fixed ORB/IVB auto-execute firing an immediate market order at "
+            "whatever price was live instead of waiting for price to retest "
+            "the reported volume-profile reload zone — now places a pending "
+            "order that only fills on a genuine zone retest (60-minute "
+            "expiry, with a Telegram alert if the zone is never retested).",
+            "ORB/IVB report now includes the Asian session range (high/low) "
+            "and an untested-extension target beyond the primary breakout "
+            "target; report naming corrected to consistently say 'ORB/IVB' "
+            "instead of just 'IVB'.",
+            "History > Trade History: added a R:R (reward:risk) column, "
+            "computed per trade from its own entry/stop/TP1 levels.",
+            "Fixed Max TP Hit not populating on trades opened by the other "
+            "paired node — now falls back to the cross-node consolidated "
+            "ledger, same as the Channel and Strategy columns already did.",
+            "Reversal Engine: recalibrated signal-scoring weights against a "
+            "backtest of 767 real Gold Diggers VIP/GD2 signals — round-number "
+            "levels (round_5 especially) weighted up, Asia range/swing levels "
+            "weighted down to match their measured real-world hit rates.",
+            "Fixed Reversal Engine nightly research silently failing on high-message "
+            "nights — AI call timeout widened from 60s to 240s, plus a "
+            "dedicated failure-alert email so a failed run is never silent.",
+            "Fixed app version reporting: Settings > Update 'Installed "
+            "Version' and the admin console's per-client version display "
+            "were reading a separately-maintained file that had drifted out "
+            "of sync with the real release version — both now read the same "
+            "canonical version source as the rest of the app.",
+        ],
+    ),
+    (
+        "v0.41",
+        "Fix: missing dependencies",
+        "orange",
+        "",
+        [
+            "Fixed 'ModuleNotFoundError: cryptography' crash on startup — the "
+            "package was imported by MT5 credential encryption and the sync "
+            "channel's TLS certs but never declared in requirements.txt, so a "
+            "fresh install/VPS never got it via pip install.",
+            "Also declared python-dateutil explicitly (used directly in the news "
+            "calendar) rather than relying on it arriving transitively through "
+            "yfinance → pandas.",
+        ],
+    ),
+    (
+        "v0.4",
+        "Local/Remote Sync",
+        "blue",
+        "",
+        [
+            "New Local/Remote mode toggle in the header (replaces the strategy badge) — a Mac and a VPS instance of this app can now pair up, with exactly one of them ever executing new trades at a time via a STAND_DOWN/RESUME handshake over a dedicated TLS-secured sync channel.",
+            "Settings > Remote Node: configure this machine as the VPS (accept connections, generate a shared token) or as the client (connect to a VPS's fixed IP).",
+            "Settings changes made on either node propagate to the other automatically — the VPS holds the authoritative copy.",
+            "Consolidated trade ledger: closed trades from both nodes merge into one combined view without ever touching either side's own operational databases.",
+            "Manual, on-demand ML model snapshot transfer between nodes (download/upload) — models otherwise train independently per node.",
+            "Switching from Local back to Remote is blocked while this node still has open positions, rather than abandoning or silently orphaning them.",
+        ],
+    ),
+    (
+        "v0.3",
+        "Windows Compatibility",
+        "green",
+        "",
+        [
+            "Native Windows support confirmed and hardened — watchdog, self-healing, automatic demo/live account switching, and automatic Algo Trading enable all verified working on native Windows exactly as on macOS, no CrossOver/Wine required.",
+            "'Setup & Start FOREX.bat' now auto-launches the MetaTrader 5 terminal on startup if it isn't already running, mirroring the macOS '.command' script — reads the saved terminal path from bridge_credentials.json, waits for MT5 to initialise before the bridge attaches.",
+            "Fixed two hardcoded macOS-only data paths (history.py trend report, signal_generator_report.py) that would have crashed on Windows — both now use the platform-aware DATA_DIR constant.",
+            "Self-healer's bridge-restart-failure message is now platform-aware (\"check the MT5 terminal\" on Windows vs \"check Wine/CrossOver\" on macOS).",
+            "Reversal Runner strategy added — new climber-ladder strategy wired through signal generation, pending-signal fill, tick dispatch, backtesting, and the Strategy dropdown.",
+            "Setup Instructions page overhauled — added dedicated Windows setup steps (native MT5 install, running the .bat), corrected the Licence Key step to match the real activation flow (Machine ID detection, automated Request Registration, Manual Activation fallback), and clarified which steps are macOS-only vs Windows-only.",
+            "Admin now receives a Telegram notification whenever a new user submits a registration / licence request, in addition to the existing admin console alert.",
+        ],
+    ),
+    (
+        "v0.23",
+        "Channel Strategy Overrides & Circuit Breaker",
+        "blue",
+        "",
+        [
+            "Global circuit breaker — single DB-persisted CB replaces all per-engine streak halts. Configurable consecutive-loss threshold and cooldown; blocks only live MT5 execution while signals and TG parsing continue. Countdown banner in balance row. Telegram notification on block.",
+            "Channel strategy overrides — per-channel strategy selection (Trailing Stop, Conservative, Scale Out, etc.) that correctly overrides the global Active Strategy for all execution paths including TG direct-fire and pending watcher.",
+            "Channel strategy UI fix — dropdown now correctly saves on change (switched to on_value_change); was silently clearing overrides on every render due to NiceGUI event argument mismatch.",
+            "Evaluate Now popup fix — switched to AsyncAnthropic client and direct on_click assignment; was blocking the event loop and losing NiceGUI client context.",
+            "Breakout signal stuck-open fix — MT5 closure sync check added to both breakout and bounce engines; signals with a live trade closed between TP1 and final TP no longer get permanently stuck as triggered/open.",
+            "Max TP Hit now evaluated against original Telegram signal TP levels, not the strategy's overridden TPs — accurately reflects how far price ran vs signal targets.",
+            "Trailing Stop strategy — SL locks at entry on TP1, then trails price by configurable distance (pts); distance label corrected from $ to pts.",
+        ],
+    ),
+    (
+        "v0.22",
+        "Bounce Generator & Real-Time Monitoring",
+        "purple",
+        "",
+        [
+            "TEST tab renamed to Bounce Generator — password gate removed, accessible directly from the main tab bar.",
+            "Signals section added to Trading > Strategy — two independent toggles: Telegram Signals (accept/ignore TG channel signals) and Bounce Generator live execution (route generated signals through the full MT5 pipeline).",
+            "Bounce Generator live execution — when enabled, triggered signals flow through the full main engine: Risk Governor, strategy SL/TP overrides, MT5 order placement, Telegram notification, History, and all stats. Virtual signal continues tracking independently.",
+            "Real-time monitoring — velocity loop samples price every 3 seconds over a 20-second rolling window; movements exceeding 10 pts trigger an emergency scan bypassing the candle gate. Liquidity sweep detector watches M15 swing highs/lows for touch-then-reversal patterns.",
+            "Outcome check interval reduced from 60 s to 5 s — TP/SL detection for virtual signals is now near-real-time.",
+            "Message detection latency reduced from 480–1100 ms to ~18 ms — replaced sleep-poll loop with asyncio.Event wake-up, deferred sender resolution, and background DB writes.",
+            "Recheck race window eliminated — open_trade_from_signal() now accepts a pre-fetched tick; when the signal generator supplies its verification tick the redundant bridge round-trip and zone-recheck window are skipped entirely.",
+            "Conservative strategy fix — signal generator now correctly applies the active strategy's 5 pt fixed SL/TP from fill price (not ATR-based signal levels), and checks TP1 before TP3 in outcome tracking.",
+            "TP ordering guard in live execution — TPs are sorted into valid direction order before passing to create_signal(), preventing validation errors when signal generator TPs are non-sequential.",
+            "Risk Governor (Tier 1 safety layer) — configurable position sizing ceiling, daily-loss halt, and consecutive-loss streak halt; toggled in Risk Settings, off by default.",
+        ],
+    ),
+    (
+        "v0.21",
+        "Performance Improvements",
+        "teal",
+        "",
+        [
+            "MT5 bridge persistent HTTP connection — single keep-alive TCP connection replaces a new handshake per request, cutting bridge round-trip from ~7ms to ~1.5ms.",
+            "Adaptive monitor loop — tick and trade checking now runs every 1 second when trades are open (was 5 seconds), reducing TP/SL response lag by up to 4 seconds.",
+            "Pre-fetch fresh tick before order placement — SL/TP calculations and fill-price fallback now use a live price fetched at the moment of order submission rather than a cached value.",
+            "Telegram (Telethon) latency improvements — switched to ConnectionTcpAbridged (compact packet framing), moved network calls off the event handler onto a dedicated queue processor, reduced backup poll interval from 1s to 30s.",
+            "DC alignment verified: Telethon session and both Gold Diggers channels confirmed on Telegram DC4 (Amsterdam) — optimal for UK location with no cross-datacenter relay.",
+            "TG Learning mode — toggle on the TEST panel feeds recent Gold Diggers provider signals to Claude as context when scoring generated signals, improving directional alignment.",
+            "Out-of-Hours improvements — OOH header badge now correctly shows the OOH strategy name (not the base strategy) when the time window is inactive; OOH strategy label reflected in open trade cards and Telegram messages.",
+            "OOH holiday date range — calendar date picker added to Out-of-Hours settings with enable/disable checkbox, allowing multi-day holiday coverage beyond the time window.",
+            "New Telegram commands: /restartapp (remote restart), /switchlive and /switchdemo (environment switching), /help updated.",
+            "Weekend email suppression — daily summary emails no longer sent on Saturdays or Sundays.",
+            "Bug fix: /restartapp restart loop — bot update offset now persisted to database and restored on startup; processed commands are never replayed across restarts.",
+            "Bug fix: no-SL scale-out partial close executing at a loss — added breakeven guard to instant-fire TP1 path so partials only fire at market when price is at or better than entry.",
+            "Bug fix: OOH banner showing wrong strategy name when OOH enabled but outside active window.",
+        ],
+    ),
+    (
+        "v0.2",
+        "TEST Module — Claude Bounce Generator",
+        "blue",
+        "",
+        [
+            "Added TEST tab (password-protected, machine-locked) — isolated Claude-powered XAUUSD signal generator that runs entirely separately from the main app.",
+            "Virtual trading engine: generates signals from rules-based analysis (H1 HTF bias, key levels, M15 candle confirmation) reviewed by Claude before entry.",
+            "Virtual position sizing: 2% risk per trade, lot size auto-calculated from SL distance and running balance, starting at $1,000.",
+            "Isolated database (test_signal.db) and dedicated log file — no data is shared with or affects the main application.",
+            "Active positions and full trade history with dollar P&L, lot size, and running balance displayed after each closed trade.",
+            "Post-trade learning notes: Claude explains why each trade won or lost in one sentence; batch pattern analysis every 10 trades.",
+            "Performance analytics breakdown by session, HTF bias, and key level type to identify what conditions produce best results.",
+            "Circuit breaker: pauses new signals after 3 consecutive losses; resets manually from the UI.",
+            "Minimum quality score gate (60%) — Claude-scored signals below threshold are skipped.",
+            "Fixed instant-entry signals executing with stop_loss=0.0 — provisional $60 protective stop now applied immediately and replaced when follow-up arrives.",
+        ],
+    ),
+    (
+        "v0.11",
+        "Bug Fixes",
+        "amber",
+        "",
+        [
+            "Fixed MT5 broker timestamp offset — Vantage Markets server time is UTC+3; all deal history queries now apply the correct offset.",
+            "Resolved signal parser edge cases for GD2 channel (GOLD DIGGERS 2.0) partial messages sent before SL/TP are appended.",
+            "Strategy handler improvements across all five strategies — skipped TP levels now correctly inserted into vantage_partial_closes for UI chip display.",
+            "Improved Telegram bot error messages for unknown strategy aliases.",
+            "UI stability fixes: strategy description card no longer flickers on tab switch.",
+        ],
+    ),
+    (
+        "v0.1",
+        "Initial Beta Release",
+        "green",
+        "Beta",
+        [
+            "Core MT5 bridge integration via CrossOver/Wine on macOS — supports demo and live accounts.",
+            "Telegram signal parsing for Gold Diggers VIP (Format A/B) and GOLD DIGGERS 2.0 (Format C).",
+            "Live tick feed with bid/ask/spread display and real-time P&L tracking.",
+            "Five trading strategies: Scale Out + Breakeven, Breakeven Runner, Trailing Stop, Protected Scale, Conservative.",
+            "Dynamic Position Management (DPM) with ATR-based trailing stop and peak P&L drawdown guard.",
+            "Partial close engine with per-TP tracking in vantage_partial_closes table.",
+            "Telegram bot (/strategy, /risk, /pause, /resume, /status, /close, /ime-on, /ime-off).",
+            "Daily and weekly email reports via Resend or SMTP.",
+            "AI trade commentary via Claude API (Anthropic).",
+            "Strategy Builder for manual signal entry.",
+            "History tab with closed trade review, MT5 import, and performance statistics.",
+        ],
+    ),
+]
+
+
+def _derive_version() -> str:
+    """Read the current version from RELEASES[0] and sync the root VERSION file.
+
+    The VERSION file is a fallback for callers that cannot import this module
+    (the remote client/server read it when the package import fails). It lives
+    at the repo root now that the forex_trader package is gone.
+    """
+    from pathlib import Path
+    ver_str = RELEASES[0][0].lstrip("v") if RELEASES else "unknown"
+    ver_file = Path(__file__).resolve().parents[3] / "VERSION"
+    try:
+        if ver_file.read_text(encoding="utf-8").strip() != ver_str:
+            ver_file.write_text(ver_str + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    return ver_str
+
+
+__version__ = _derive_version()

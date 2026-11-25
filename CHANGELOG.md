@@ -1,0 +1,722 @@
+## v0.616 — Bug fixes, security enhancements and general improvements (2026-11-06)
+
+The About screen carries the user-facing summary; this is the engineering
+record. 11 commits since v0.615, plus the dependency fix and this release's own.
+
+**Bug fixes**
+- `utils/broker_clock.py`: the broker is UTC+2 in the US winter, not a fixed
+  UTC+3. The day and session a close is filed under, the trade table's since
+  filter, `mt5_performance` and `todays_realised.realised_since` (the daily
+  goal, its % opening balance and `goal_breakeven`) convert through it.
+- Launcher: an unescaped `)` ran the install on every start. Escaped, and
+  `PIP_PREFER_BINARY` set in the Windows and Mac launchers.
+- Cross-asset peers: `mt5_symbols.py` resolves the broker's name for a symbol;
+  `/candles_range` puts every non-gold symbol in Market Watch before reading
+  and takes a peer's offset from gold's quote; `xasset_sweep` re-measures days
+  stored with a peer missing and stops retrying a broker with no peers.
+- The nightly research study gates on `is_active_trader_node()`.
+
+**Security enhancements**
+- `frontend/package-lock.json`: vite 6.4.3 to 6.4.5, vitest and @vitest/mocker
+  4.1.11 to 4.1.12, source-map-js 1.2.1 to 1.2.2, closing Dependabot alerts 1-5
+  (GHSA-68fv-2mgg-jv7q, GHSA-xp26-3454-mjgp, GHSA-qxg6-89mg-rqv8,
+  GHSA-698v-4r3x-3vcv, GHSA-rq7h-c2jc-7f22). Development scope only; rebuilding
+  gives a byte-identical `frontend/dist`.
+- PortableGit is checked against its pinned SHA-256 by the app and
+  `Setup & Start FOREX.bat`; the .bat forces TLS 1.2. The .iss does not check
+  the hash yet.
+
+**General improvements**
+- Risk switches, off by default (migration 65): `never_add_to_loser_enabled`,
+  also refusing while a same-direction signal is in flight, and
+  `daily_limit_counts_open_risk`. Both only refuse.
+- ML training data merge between nodes (docs/todo/026): imported rows go to
+  `ml_imported_rows`, used only by training sets with the kind's switch on.
+- `core_git_install.ensure_git()` installs PortableGit at startup on Windows
+  when the machine has no git (spec 027).
+
+**Not done or not yet exercised**
+- `governor.rg_day_start_ts` stays on the fixed 3 hours; it decides halts and
+  needs its own sign-off.
+- No demo session has run with either Risk switch on. The Market Order dialog's
+  orders are not seen while in flight.
+- `ensure_git()` had not run on Windows, and the peer reads had not run against
+  a real terminal, when those changes were committed.
+- `Stop FOREX.bat` and `Windows Uninstall.bat` keep the same unescaped `)`, and
+  requirements stay unpinned.
+
+## v0.615 — Analytics, more AI providers and news on the charts (2026-10-21)
+
+The About screen carries the user-facing summary; this is the engineering
+record. 9 commits since v0.614, plus this release's own.
+
+**News on the charts** (docs/todo/025)
+- NEWS button on the Dashboard chart and the Chart tab's Broker view:
+  per-bar tint and H/M/L letter by strongest impact, H/M/L and USD/All
+  filters, hover shows the releases and the move to the close 30 min on.
+- `GET /api/calendar/chart_news?from_ts&to_ts`: kept history (high, medium)
+  merged with the live feed's week (adds low; holidays dropped), max 400 d.
+- Broker clock = New York + 7 h, per event; corrected by a fresh tick.
+
+**Analytics** (docs/todo/024)
+- MAE/MFE/capture per closed trade from M1/M5 bars
+  (`trade_excursion_cache`, migration 64).
+- Analysis > Risk: Monte Carlo of the next N trades, 5,000 seeded paths.
+- News tab: CFTC managed money (COT index) and GLD tonnes, cached.
+
+**AI providers**
+- OpenAI, Gemini, xAI, Mistral and OpenRouter on one OpenAI-protocol
+  adapter (`services/ai/provider.py`). The provider dropdown saves
+  `ai_provider` (it saved `provider`, which nothing read).
+
+**VPS**
+- Engine, Brain and Trend PA panels read the VPS over the peer-report
+  channel when it generates; a headless VPS offers them too
+  (`offer_panels_to_peer()` from `app.startup()`).
+- Ledger sent in ~256 KiB frames; the Mac accepts up to 32 MiB (was a 1009
+  close on every connect past 1 MiB).
+
+**Bug fixes**
+- `/api/system/releases` has a response model: the About page got raw
+  tuples and drew "—" with no notes for every release.
+- Ladder Reach reads `avg_rung` and credits a rung from the close price; the
+  compound calculator's ranges widened.
+- The bridge's missing-server-offset refusal is logged once an hour.
+
+## v0.614 — Bug fixes, calendar improvements and ML improvements (2026-10-20)
+
+The About screen carries the user-facing summary; this is the engineering
+record. 30 commits since v0.613, grouped as the owner asked.
+
+**Bug fixes**
+- MT5 bridge: `/ticks` and `/tick_at` pause after a hung read (5 min,
+  doubling, capped at 6 h while it keeps hanging); the self-healer and
+  watchdog wait out a recent hang instead of restarting. The client sends
+  one tick-history read at a time and keeps the pause in
+  `DATA_DIR/tick_history_pause.json` across restarts. Cause outside the app:
+  MT5 on access point AS01 stops serving tick history.
+- Breakout hands go/retest/sweep the closed M5 bar, not the forming one;
+  Asian ranges and H1 bars are read in true UTC (`market/bar_clock`).
+- Breakout ledger charges a BUY the spread once (`ledger_cost_pts`), and a
+  BUY's break-even stop is entry + ledger cost (handover 054, owner-approved
+  test changes).
+- Set & Forget confirmations and AI validation; Trend PA / Reversal /
+  Breakout entry correctness (owner-approved characterization change).
+- The Mac's settings survive a reconnect to the VPS (`_adopt_peer_state`
+  queues local differences before mirroring down).
+- Reversal Engine trades: the strategy label follows the schedule window,
+  and Max TP is graded on the trade's own ladder (one-time repair).
+- EA closes labelled "EA TP" / "EA close" from `DEAL_REASON`; "No losses"
+  replaces a red 0.00 profit factor; "Resume anyway (ignore today's goal)".
+- Daily AI analysis format-spec crash fixed; AI analysis no longer called
+  Claude's; the remote client's LAN scan skips public addresses; the
+  evidence collector's context query uses an index seek (a full pass
+  went from about 3 min to 0.18 s).
+- A close Windows cannot convert yields no trading day (CI OSError 22).
+- The Bounce engine is removed from the registry, sync and stats.
+
+**Calendar improvements** (docs/todo/023)
+- % gain of the opening balance per day, week, month and year; each
+  trade's strategy in the day popup.
+- Cell figure toggle ($ / % / pips / R), day stats (profit factor, averages,
+  best, worst, fees, peak, realised drawdown, P&L curve), streaks, weekday
+  totals, a year view, and markers for goal reached, loss limit reached,
+  news and journal notes.
+- Day journal (`/api/calendar/journal`, `day_journal` in reversal_engine.db
+  per `account_env`) and news history (`news_history.json`, kept from each
+  feed fetch; `/api/calendar/news`). Provisional defaults: handover 055.
+
+**ML improvements**
+- Time-decay training weights, executed-trade labels, Breakout realised-R
+  label with an AUC gate, market-state features (migration 62, all off).
+- "Is it learning?" plots realised R and shows each model's label, weights
+  and effective sample size; Breakout's ML switches moved to its own tab.
+- Recorded: the reversal online SGD term fits the median of R (no change).
+- Research: session-drift trials (no edge); optional round-number exits
+  and volatility-forecast stops for templates (migration 63, off).
+
+## v0.613 — Security, bug fixes and app improvements (2026-10-11)
+
+The About screen carries the user-facing summary; this is the engineering
+record. 92 commits since v0.612, grouped as the owner asked.
+
+**Security improvements**
+- `checks.yml` and `windows-probe.yml` set `permissions: contents: read`, so
+  the GITHUB_TOKEN no longer gets the repo's default scope.
+- TLS test servers pin `minimum_version` to TLS 1.2; tests use `tmp_path`
+  instead of the deprecated `tempfile.mktemp`. The other ten code scanning
+  alerts were dismissed on GitHub with reasons.
+- The admin console's `index.html` is served `no-store`, so a browser never
+  runs a stale console against a newer API.
+- A request body with a NaN literal is answered 422, not 500.
+- `apply_update()` stashes tracked edits ("Set aside by Update <time>")
+  before `checkout -f`; a failed stash stops the update and touches nothing.
+
+**Bug fixes**
+- Daily goal and daily-loss limit count the Trading Clock's day
+  (`clock.day_start_ts()`); Resume no longer lifts a secured goal or forgets
+  a pre-Resume loss; the goal is measured on MT5's realised figure.
+- A profit target is `pnl >= target`, asked fresh (handover 038 answer B):
+  a loss below it re-opens trading. The 2026-10-05 latch is removed.
+- A trading pause stops the limit and resting-order routes; manual orders
+  still go through. A queued signal is replaced when its channel re-posts a
+  correction within 120 s.
+- A refused close retries under the other filling modes (retcode 10030). A
+  channel's "move SL to break even" never loosens a stop.
+- `gross_pnl` and `realised_pnl` follow the broker on profit sync (bugs/049),
+  with a boot backfill for older rows.
+- `get_equity_drawdown_pct` reads the app_config `peak_balance` watermark; it
+  read a removed column and returned 0 for every stored ML vector.
+- Two dashboard reads no longer stall the trading loop; latency timings use
+  `perf_counter` on Windows; `_get_tick_at` returns the quote in true UTC.
+- A settings save invalidates the poll keyed by its URL, so the Dashboard
+  shows a changed daily loss limit at once.
+- EA v1.10: silence while blocked in OrderSend is not the app going away.
+  The EA installs into a portable terminal's own Experts folder.
+- A price typed with a trailing full stop is read; plain TP lines parse.
+- ORB, Trend PA and Set & Forget: fixes found by replaying them on real gold.
+
+**General app improvements**
+- Contradiction review between signal sources (handover 041, migration 59,
+  off): refuses a signal when another source opposes it and the market
+  review favours the other side or neither. Never cancels or closes.
+- Auto templates: one regime source (`live_regime`), an optional H1
+  classifier (migration 60, off), and an optional dwell before a regime
+  change acts (`auto_regime_min_dwell_ticks`, default 1).
+- Reversal engine: an optional volatility-regime tail on the ML vector
+  (migration 61, off), vol-target sizing wired but off, a one-row-per-signal
+  virtual ledger and protected online learning.
+- Breakout's dual-bias gate applied ON once per database (bugs/060).
+- Daily goal can move open trades to break even; Dashboard 1D/1W/30D/All,
+  wider equity curve, market badge, "Session Switched Off"; Broker chart
+  scrolls back; Feedback button; losing days in the Compound Calculator.
+- One definition of the trading sessions (21:00-24:00 UTC is no session).
+- Not yet run through a demo session.
+
+## v0.612 — The VPS trades Telegram itself (2026-09-29)
+
+The About screen carries the user-facing summary; this is the engineering
+record. 57 commits since v0.611, plus this release's own change.
+
+**Telegram and engines on the active node** (docs/todo/010)
+- `scan_messages` asks `node_roles.is_active_trader_node()` instead of
+  `should_generate_signals_here()`. The standby node runs
+  `signals/standby_record.py`: pure parsers, one row with status `standby`, no
+  order, alert, AI call or keyword trigger.
+- Breakout, Reversal and Trend PA ask `node_roles.engines_generate_here()`
+  instead of returning at `is_remote_node()`; exactly one node answers True in
+  every mode, and it fails closed. The research timers stay Mac-only.
+- `sync/_channel_setup_sync.py`: `MSG_CHANNEL_SETUP` (slots, parser config,
+  lexicons, Mac -> VPS) answered by `MSG_CHANNEL_SETUP_ACK`, shown on
+  Settings > Remote node. Never clears a VPS slot the Mac did not send.
+- The same message carries the Mac's hand-set channel pauses
+  (`channel_performance` rows with `manual_override = 1`) and the news
+  blackout (four config.yaml keys, validated against the calendar's own
+  clamp and impact sets). An older Mac that sends neither changes neither;
+  the ack names only the parts sent.
+- Instant entry refuses a paused channel (`get_channel_lot_mult`), which only
+  `resolve_open_trade_params` did before.
+- Not yet run through a demo session.
+
+**Sizing** (owner, 2026-09-29)
+- `resolve_open_trade_params` sizes a template trade from the template's own
+  stop (`template_sl_at` at the tick), the stop the order is sent with, not
+  the signal's. One Risk % had given 0.02 to 0.07 lots and about 1% to 5% at
+  risk. Instant entry and the Reversal Engine's limit orders already did
+  this. `sl_pips = 0` still sizes from the signal's stop.
+- Two queued-path override tests now set `sl_pips = 0` (owner-approved): they
+  pin the per-leg split, not which stop is used.
+
+**Since v0.611 (committed)**
+- Pairing: full settings sync, MT5 accounts and demo/live follow the Mac, EA
+  template sync and missing-template refusal, remote restart/upgrade/resume/
+  close/engine start, commit report with the reason nodes differ, forced
+  take-over without the peer, VPS settings and trading status to the Mac.
+- Trading: Trend PA engine, daily profit goal, per-channel daily loss cap (off
+  by default), Max Open Trades on live trades only, broker-counted open
+  trades, rejections as refusals, placeholder write-off rules, AutoTrading
+  re-enabled with an alert, 30 s minimum EA template ack wait.
+- Dashboard: brain view, fill costs, GLD GEX, chart drawings/TradingView/order
+  buttons/position tool, Compound Calculator, latency view.
+- Windows: bootstrapper installer, EA install at startup, bridge terminal
+  discovery and login, restart under the launcher, perf_counter timings, CI
+  timeout 90 min.
+
+**Uncommitted work from other sessions, shipped here (bug 070 and follow-ups)**
+- Every bridge lists the orders MT5 still holds; reconciliation and the
+  placeholder repair tell "in flight" from "did not fill"; an adopted
+  placeholder is handed to the EA at once.
+- Resume the VPS's trading from the Mac's header; Restart bridge on
+  Settings > MT5; the Analysis spread cache is written again; a headless node
+  stops for an upgrade; the version line says when this machine has unpushed
+  commits.
+
+## Unreleased: Feedback
+
+- **Feedback button** after the About tab. Opens a popup for feature requests,
+  bug reports and general feedback. Sending alerts the owner by Telegram and
+  email and adds the entry to the admin console's new Feedback tab, where it
+  can be marked Completed. An install that cannot reach the admin server
+  queues the feedback and sends it on the next connection.
+- **Feedback noted and completed.** Marking an entry Completed in the admin
+  console now tells the sender: their dashboard shows a "Feedback noted and
+  completed" popup naming which piece of feedback it was, once, until Close.
+  Each install keeps the ids it sent (`remote/feedback_sent.json`) and asks
+  about them on each server ping (`MSG_FEEDBACK_ASK` / `MSG_FEEDBACK_DONE`);
+  the notices ride the header poll as `feedback_done`. No forex-admin change.
+- **New-feedback alert on the admin node.** Where the licence admin console
+  is mounted, the title bar shows "N NEW FEEDBACK" when feedback arrives.
+  Clicking it shows the entries and marks those ids read, and the alert goes
+  away. Store rows gain `read`; rows from before it count as read. The count
+  rides the header as `feedback_unread` (always 0 off the issuer); entries
+  come from `GET /api/feedback/inbox`, `POST /api/feedback/inbox/read`.
+- **Reply email on the Feedback popup.** "Add your email so we can reply"
+  reveals an optional email field. When given, it replaces the install's
+  stored email on the entry, so Telegram, the alert email (now a `mailto:`
+  link), the admin console and the new-feedback popup all show it. A
+  malformed address is refused before anything queues. Older dashboards that
+  post only kind and message are unaffected.
+
+## v0.611 — Windows install and VPS setup (2026-09-25)
+
+The About screen carries the user-facing summary; this is the engineering
+record. Found installing v0.61 on a fresh Windows VPS.
+
+**Installer**
+- Installs the Visual C++ Redistributable (x64) before the pip install:
+  `lib_lightgbm.dll` links the MSVC runtime, and a bare Windows image has none,
+  so `import lightgbm` failed at startup and the app crash-looped (bugs/066).
+- No longer opens TCP 8765; removes that rule on uninstall. Writes
+  `open_browser_once`, which `run.py` honours once, even on a VPS.
+
+**Updates**
+- `link_checkout()` could never link an installer copy (part of the tree, no
+  `.gitignore`) and, on Windows, left an unborn `.git` behind because rmtree
+  could not delete git's read-only objects. That produced "could not resolve
+  local HEAD" on Settings > Update and "commit unreadable" in the admin
+  console. Now a subset match with install-local paths excluded, a
+  read-only-safe clean-up, and a self-repair for the leftover (bugs/067).
+
+**Remote node**
+- "Make this node a VPS": token if none (shown once), firewall rule on every
+  profile (plain `netsh`, then a UAC prompt), listener started. "Stop being a
+  VPS" reverses it. On the VPS: addresses, NAT warning, firewall status, and
+  what secures the link. `services/cluster/sync/reachability.py`.
+
+## v0.61 — Stall fixes and a quieter log (2026-09-25)
+
+The About screen carries the user-facing summary; this is the engineering
+record. 4 commits since v0.6.
+
+**Stalls**
+- `POST /api/backtest/run` ran the walk inside `async def`, blocking the event
+  loop for up to 86 seconds with no position monitor, EA link or Telegram
+  running. The heavy steps now run on `asyncio.to_thread`; the route calls the
+  same controller names.
+- The ORB chart is now drawn on a thread with matplotlib's object API rather
+  than `pyplot`, whose global figure registry is not thread-safe.
+- The Reversal Engine's batch retrain now reads and fits on a thread and
+  installs on the loop; the fit goes into a local and is swapped in fitted,
+  rather than installing before fitting. `retrain_now` is removed; its one
+  caller now awaits `retrain_async`.
+- `LoopMonitor` gains a sampler thread that reads the loop thread's stack
+  while a stall is in progress, so a warning names the blocking line.
+
+**Security**
+- The Telegram bot token no longer appears in `forex_trader.log`, which
+  Export Logs emails. `run._SecretScrubber` rewrites every record on the
+  app's handlers, not just the diagnostics upload. Tokens already in older
+  log files are untouched; rotating the token is the owner's call.
+
+**Diagnostics**
+- `tools/order_latency_report.py` reads MetaTrader's own daily logs and
+  reports, per trade server, how long executions took (count, median, p90,
+  max, and how many ran over 5s). Reads files only; places nothing and
+  reaches no broker.
+
+**Repository**
+- The owner's private notes (`docs/simon-handover`, `docs/todo`,
+  `docs/reviews`) moved out of this public repo into the private
+  `MooreSi/forex-gold-notes`, attached back at the same paths via
+  `tools/private_notes.sh` and `git private`.
+
+## v0.6 — React Frontend Migration (2026-09-24)
+
+The dashboard moved from NiceGUI to React. The About screen carries the
+user-facing summary; this is the engineering record. 280 commits since v0.5.
+
+**The dashboard**
+- React app in `frontend/src`, built to `frontend/dist` (committed and served
+  by the app), over a new HTTP layer in `backend/src/api/`. Routers forward to
+  controllers only; `api/` never imports the database or a service. The
+  decision, and the 2026-08-06 one it reverses, is in
+  `docs/system/domains/frontend/010-the-react-decision.md`.
+- Every tab ported, plus what the old one never had: a Dashboard home page,
+  light/dark theme, trading-status badge, Schedule screen, fair-value gaps,
+  per-day candles in Analysis, the Breakout panel, DPM Analysis, the AI page,
+  Set & Forget, an EA template editor with rename, Export Logs.
+- CI builds the dashboard and fails on a stale bundle.
+
+**Accounts and nodes**
+- One database per MT5 account, and a demo/live switch that moves MetaTrader 5
+  as well as the database and config.
+- Single-instance boot across both checkouts (`utils/single_instance.py`),
+  MT5 started on a Mac at boot, and a watchdog that no longer restarts the
+  other checkout's app.
+- The Mac recognises positions the VPS opened; per-account MT5 terminal path.
+
+**Trading behaviour** (each new gate off by default, and the owner's to arm)
+- Only trade with the trend (`htf_bias_gate_enabled`), honoured by every order
+  route; resting orders withdrawn against the trend; queued signals
+  re-validated before execution.
+- Limit orders rest and the template manages the fill; Immediate Market Entry
+  is one global setting; a template's own stop and anchor lot are used as
+  written.
+- Telegram decision log, contradiction study, event-tier gate and stale-release
+  guards.
+
+**Reversal Engine**
+- Measurement and gating layer, macro context, nightly research study, AI
+  tuning of the switches, and an ML model handed over across a version bump.
+- The meta-labeller is fitted daily (it had never been fitted). The panel shows
+  the win rate against the no-edge rate SL/(SL+TP): 75.5% expected, 74.4%
+  actual over 4,681 signals. Cross-asset context (reversal-engine/230) is
+  recorded for every signal; toggle `re_xasset_features_enabled` is off. It
+  lifted the meta-labeller's out-of-sample AUC from 0.553 to 0.558.
+- The Bounce engine is deleted.
+
+**Open source**
+- Public under AGPL-3.0. A GitHub install is admitted without licence approval
+  and cannot update itself into the old app.
+- The Telegram bot token no longer leaves in a diagnostics upload.
+
+## v0.5 — Refactor (2026-09-02)
+
+The release the refactor closes out. Version history and the About screen
+carry the user-facing summary; this is the engineering record.
+
+**Windows is a supported client platform.** The suite runs green on Windows CI
+for the first time. Four of the defects that got it there were invisible on
+macOS, and three were tests that encoded the developer's own machine — its
+timezone, its file-permission model, its socket behaviour, its process lookup.
+
+**Security**
+- Every file the app writes a secret into is restricted per platform through
+  `utils/file_perms.restrict_to_owner`. `os.chmod` does not restrict a file on
+  Windows, so the bridge credentials (holding the broker password in
+  plaintext), the private CA key, the credentials encryption key and the
+  licence all landed `0o666` there.
+- bugs/014 closed: the licence/admin channel is authenticated. Internet path
+  verifies against a private CA bundled in the build; LAN pins on first use.
+- bugs/022: Telegram approval signed licences for an empty machine id on one
+  of the two registration paths, so approval succeeded and delivered nothing.
+- bugs/021: the activation screen can approve a registration from Telegram,
+  through a poller restricted to that one action.
+
+**Correctness**
+- The Windows bridge watchdog could not enumerate processes at all, so it
+  could never restart a dead bridge. `wmic` is replaced by a PowerShell CIM
+  query; the query was then found to match its own process.
+- The test suite made live, billed calls to the DeepSeek API on every run, and
+  read (and on a fresh machine would have written) the developer's real OS
+  keychain. Both are blocked at the transport now.
+
+**Guardrails that were reporting success while checking nothing**
+- The timer gate had reported zero offenders since 2026-08-31 while four were
+  live: it matched controller imports by name, so aliased imports were
+  invisible.
+- The coverage artifact upload had never uploaded anything — a dotfile, and
+  `include-hidden-files` defaults to false.
+- The Getting Started checklist asked the Telegram reader for keys its status
+  dict has never had.
+
+**Removed on the owner's instruction**
+- The Bounce generator, TP HIT parsing, and the win-rate figures beside each
+  channel's strategy picker.
+
+**Structure**
+- Five of seven import contracts enforced at zero; no file over its ceiling;
+  cluster code from no tests to 84%.
+
+## Unreleased — Money-path hardening + a bug class closed (2026-08-28 → 2026-08-31)
+
+**Nothing in the "money path" section below is verified against a broker.**
+Every item there is written, tested and mutation-tested, and none is finished.
+Finishing each one needs Simon at a demo terminal:
+`docs/simon-handover/013-the-five-demos-runbook.md`.
+
+### Money path — IMPLEMENTED, NOT SIGNED OFF (demo required for every item)
+- **A slow EA no longer causes a second order.** When the EA's acknowledgement
+  timed out, the fallback placed another order for a trade the EA may already
+  have on the book — and the two send paths stamped different identifiers, so
+  no check was even possible. Both now carry the trade id, and the fallback
+  asks the broker before sending. On 2026-07-30 this turned five signals into
+  roughly 133 opens (stage3/010).
+- **A send that gets no answer parks the signal as `unknown`** instead of
+  returning it to `pending`, which the scheduler re-activates every 20 seconds.
+  A rejection still stays retryable — the broker saying "no" is information;
+  a timeout is the absence of it (stage3/020).
+- **A refused broker close no longer becomes a database close.** `success=False`
+  was never checked, so a refused close was recorded at the app's own local
+  price while MT5 still held the position — the app then stopped managing a
+  live trade and booked a profit that never happened. Two existing tests had
+  enshrined that behaviour and were rewritten (stage3/040).
+- **Broker↔database reconciliation** reports positions the app placed and lost
+  the row for, and rows with no broker record. Read-only, asserted so by a
+  structural test. **The repairers are deliberately not built** — they would
+  write, through the frozen close path (stage3/030).
+- **Protective halt numbers now agree with each other.** The risk governor fell
+  back to 20% for both the daily-loss and drawdown limits while the schema said
+  3%/8%; all three sources now say 3%/10%. Both post-close halt checks are loud
+  on failure instead of swallowed at debug level (stage3/050).
+- **Closing a trade twice no longer pays out twice.** `apply_full_close` ran
+  `balance = balance + ?` with no guard; it is now a compare-and-set that only
+  an `open` trade satisfies (stage1 2/040).
+- **The trade-slot cap is enforced inside the atomic claim**, closing a race
+  where two signals could both pass the check. A stranded-claim sweep releases
+  a claim abandoned by a crash, keyed on when the claim was made — keying it on
+  the signal's age would have released in-flight opens and opened them twice
+  (stage1 2/030).
+
+### Fixed
+- **A phantom trade held one of five trade slots.** A placeholder row with
+  `grid_legs_total IS NULL` could never satisfy the existing expiry condition,
+  so it sat open at a fabricated P&L indefinitely (docs/todo/bugs/016).
+- **One malformed Telegram message produced 8,319 log lines**, rescanned
+  forever (docs/todo/bugs/015 — the log half; the recording half is deferred,
+  see the ticket).
+- **Backtests scored every timed-out trade as break-even.** Seven of eight
+  simulators marked a time-stopped trade out at its entry price rather than the
+  price it was actually cut at, so every strategy's timeout behaviour looked
+  free (docs/todo/bugs/017).
+- **Four cluster modules referred to 15 names that did not exist** after being
+  split out of the two cluster servers. `_read_changelog` runs on every
+  successful remote client connection, so a client would have been welcomed,
+  licensed, then dropped before it learned what version to update to; the LAN
+  discovery beacon raised on its first iteration (docs/todo/bugs/018).
+
+### Security
+- **The cluster sync channel now authenticates the server it connects to.**
+  `tls_util`'s docstring promised a fingerprint check against a function that
+  did not exist anywhere in the tree, and nothing called `getpeercert()` — so
+  the "TLS" was encryption without authentication. Trust-on-first-use pinning,
+  with the token sent only after the pin verifies (docs/todo/bugs/014).
+  The licence channel is deliberately NOT pinned yet: unlike sync it has no
+  recovery route if a pin goes wrong.
+
+### Gates
+- **New: undefined names.** A name a module uses but never defines — the shape
+  a file split leaves behind. Four bugs in this repo have taken it, all found
+  by reading rather than by a test. `tools.checks all` is now nine checks.
+- Test coverage where it was thinnest and matters most: the remote server's
+  connection front door (registration, licence delivery, token auth) 45% → 65%,
+  the update-application path 17% → 80%.
+
+### Documentation
+- `docs/guides/install-from-scratch.md` — Windows and macOS, with the failure
+  modes taken from the real branches in `Setup & Start FOREX.bat`.
+- `docs/simon-handover/013-the-five-demos-runbook.md` — the demo session, step
+  by step, so it is a confirmation rather than an exploration.
+- The split-file queue in `docs/system/rules/70-file-organisation.md` was badly
+  stale — every frontend file it listed is a package now. Rewritten from
+  measurement.
+
+## Unreleased — Upstream merge + structural sweep (2026-08-25 → 2026-08-27)
+
+Merges `MooreSi/forex` main into the refactored tree, then repairs what the
+merge cost and finishes two structural gates.
+
+### Fixed — money path (all UNVERIFIED against a broker; demo session required)
+- **Harvest closed trades at the wrong threshold.** `harvest_pips` (pips) was
+  being conflated with `harvest_threshold` (account currency), and shipped
+  defaulted to `1.0` rather than off. Two live trades closed at ~C$1.40 against
+  a $30 setting. Default is now `0.0` (off), with migration 29 clearing the
+  stale `1.0` from existing templates.
+- **The Telegram panel's IME button could turn Immediate Market Entry on but
+  never off** — the two reads used different config keys, so the "off" write
+  landed somewhere the "on" read never looked
+  (docs/todo/bugs/012).
+- **The anti-compounding revert in `PendingWatcher` had no test.** Its absence
+  had previously walked one signal's stop 110 pips over 80 passes. Now pinned.
+
+### Structural gates
+- **SQL gate: 56 statements across 22 files → 0.** Every remaining inline
+  statement moved into a repo, each behind a test written first and confirmed
+  by mutation. Four byte-identical copies of `trade_repo.get_trade` and three
+  of `broker_repo.fetch_working_pending_orders` were deleted rather than moved.
+- **Coverage ratchet green again** — `runtime.py` 63.9% → 77.7%,
+  `services/positions` 75.8% → 87.4%, `services/trading` 86.4% → 88.2%, with
+  the floors untouched (docs/todo/testing/011).
+- Import contracts, transaction boundaries and fixture-dedup back to baseline.
+
+### Decomposition
+- `ea_bridge.py` 1,947 → 715, split into `_events` / `_panel` / `_restore` /
+  `_version` / `_ids`
+- `core_bot_panel.py` 1,689 → 604; `settings.py` → 11 modules; `app.py`,
+  `history.py`, `chart`, `telegram`, `reversal_panel`, `breakout_panel` split
+- Two runtime loop bodies relocated into their services with 20 new tests
+
+### Baselines raised (owner sign-off, 2026-08-27)
+- `runtime.py` 1310 → 1509, `cluster/remote/server.py` 1196 → 1256,
+  `cluster/sync/server.py` 1073 → 1085, `mt5_bridge.py` 1335 → 1344, facade
+  method count 79 → 88. Each recorded in `structure_baseline.json` with its
+  reason. Three other entries were **tightened** in the same pass —
+  `db/database.py` had 794 lines of unnoticed headroom and was removed from the
+  section entirely.
+
+### Tooling
+- Repo-wide scanners now exclude `.claude/` — an agent worktree is a complete
+  second checkout, and one background task took four gates red with ~370
+  phantom findings.
+
+**Suite: 3,622 passing, 0 failures. `python -m tools.checks all`: 8/8.**
+
+## Unreleased — Road to Handoff (stage-2 sweep, 2026-08-11)
+
+### Onboarding & usability
+- First-run **Start Here** checklist: live licence / MT5 / algo-trading / risk /
+  Telegram / demo-mode status with "Fix this →" jumps; dismissable, reopenable
+  from Help
+- Header **Help "?"** button on every screen → Getting Started (daily routine +
+  the existing Setup/Registration/Orchestration/Glossary guides, finally linked)
+- Plain-language subtitles on all 10 tabs (as tooltips; names unchanged)
+- Empty lists now say what to do next (Trading signals, Analysis periods)
+- About reorganised into "Set up once / Every day"
+
+### Foundations
+- Schema migrations are now an ordered, numbered registry
+  (`db/migrations.py`, 12 steps) with a per-step `schema_version` stamp;
+  legacy database shapes are fixture-tested to upgrade losslessly
+- One-off data backfills moved to named steps (`db/backfills.py`) that fail
+  loud instead of `except: pass`
+- Test-suite remediation: 13 assert-nothing test files deleted (populated
+  twins verified) and structurally banned; coverage floors added for
+  `services/broker` and `runtime.py`; test-layout hazards gated; 35 duplicate
+  `fresh_db` fixtures consolidated
+
+### Debug mode (offline demo)
+- `FakeMT5Bridge` + deterministic fake market (scripted JSON scenarios under
+  `tools/debug_scenarios/`), with broker-side SL/TP settlement and error
+  injection — **not yet wired into the live bridge selection** (that 3-line
+  seam awaits the owner's sign-off + demo session)
+- Fake Telegram reader replays scripted signals through the real parser;
+  alerts/bot/news/AI/email are all no-ops or canned in debug — a debug boot
+  makes zero outbound requests
+- Unmissable **DEBUG MODE** banner; offline end-to-end test proves
+  signal → open → manage → close on the fakes
+
+### Handoff
+- `docs/simon-handover/readiness-checklist.md` — the readiness gate, honestly filled
+- Decision queue grown and provisionally answered where safe
+  (docs/simon-handover/, restructure + debug-mode QUESTIONS)
+
+## v0.8.2 — ORB Auto-Execute Fix, R:R Tracking & Version Reporting
+
+## v0.42 — ORB Auto-Execute Fix, R:R Tracking & Version Reporting
+
+### ORB/IVB report
+- Auto-execute now places a pending order that waits for price to retest the reported reload zone (60-minute expiry, Telegram alert if never retested) instead of firing an immediate market order — fixes large entry-price slippage vs. the reported plan
+- Added Asian session range (high/low) and an untested-extension target to the report
+- Report naming corrected to consistently say "ORB/IVB" instead of just "IVB"
+
+### History
+- Added R:R (reward:risk) column to Trade History, computed per trade from its own entry/stop/TP1 levels
+- Fixed Max TP Hit not populating for trades opened by the other paired node — now falls back to the cross-node consolidated ledger
+
+### Reversal Engine
+- Recalibrated signal-scoring weights against a backtest of 767 real Gold Diggers VIP/GD2 signals — round-number levels (round_5 especially) weighted up, Asia range/swing levels weighted down to match measured real-world hit rates
+- Fixed nightly research silently failing on high-message nights — AI call timeout widened from 60s to 240s, plus a dedicated failure-alert email
+
+### App
+- Fixed version reporting drift — Settings > Update "Installed Version" and the admin console's per-client version display now read the same canonical version source (VERSION file, derived from version_history.py) as the rest of the app, instead of a separately-maintained file that had fallen out of sync
+
+## v0.31 — ML Engine Overhaul, Signal Bus & Silent Mac Launcher
+
+### Signal generator ML engines (all three: Bounce, Breakout, Reversal Engine)
+- Switched from binary win/loss classifier to R-multiple regressor (LightGBM/SGDRegressor)
+- Gate threshold changed from probability > 0.5 to predicted R > 0.0
+- Lot sizing now scales with predicted R-multiple (0.5× to 1.3×) when model is trained
+- 3–4 new contextual features per engine: `news_proximity_norm`, `equity_drawdown_pct`, `concurrent_agreement`, `regime_score`
+- Model version auto-increments on feature count change; stale models discarded on restart
+- Online learner updated to SGDRegressor (Huber loss); training target is actual R achieved
+- Consecutive-loss direction cooldown: suppresses a direction after 3 losses within 2 hours
+- ML metrics panel updated: Brier/MCC replaced with Pred R / Act R display
+
+### Signal bus (cross-engine awareness)
+- All three engines write to shared `signal_bus` table on signal open
+- Conflict suppression window reduced from 600s to 180s across all engines
+- `is_still_open` flag added: bus entries clear immediately when the originating signal closes
+- `close_bus_entry()` wired into all signal close paths (TP, SL, manual close)
+- `get_concurrent_signals()` now filters to open-only entries
+- Engines passively avoid holding opposite positions simultaneously
+
+### Bug fixes
+- Fixed `name 'now' is not defined` in `_check_outcomes()` — outcome loop was failing every 5 seconds in unattended mode, preventing signal closure and ML online updates
+- Fixed `IndexError: list index out of range` on page load — Breakout and Bounce ML panels were indexing into empty `cumulative_brier` list after regressor switch
+- Removed stale Brier/MCC/calibration UI from all signal panels; replaced with R-multiple metrics
+
+### Mac launcher
+- Added `FOREX Trader.app` — double-click to start without opening a Terminal window
+- Compiled as a native AppleScript app (Mach-O binary); runs via Terminal's TCC file-access permissions, minimises Terminal window once server is ready
+- Already-running detection: double-click opens browser tab directly when app is running
+- First-run fallback: opens Terminal with `FOREX Start.command` for setup output
+
+### Windows launcher
+- Added `FOREX Start (No Window).vbs` — launches via `pythonw.exe` with no console window
+- Already-running detection: opens browser directly if port 8888 is listening
+- Restart loop (exit 42) handled in VBScript; first-run falls back to visible setup window
+
+## v0.23 — Remote Admin, Signal Generators & AI Analysis
+
+- Remote admin system: WebSocket server on admin machine (port 8443, TLS encrypted)
+- Admin panel in top banner: password-protected, shows connected clients with version and diagnostics
+- Push updates to remote clients directly from the admin panel
+- Remote client agent runs on all instances, auto-reconnects, applies pushed updates and restarts
+- Settings > Update: shows app version, connection status, registration token, changelog
+- Reversal Engine: reverse-engineers Gold Diggers VIP methodology (Asia range, swing levels, round numbers)
+- Reversal Engine: ML correlation tracking vs real VIP signals
+- Performance heatmap: AI analysis panel (Claude-powered, cached daily at 8am)
+- AI trade analysis: TP1 = win evaluation, SL width analysis, entry drift = latency context
+- AI trade analysis: signal generator development section (ML progress, self-learning assessment)
+- Diagnostics: latency report for App→Bridge→MT5 and Telegram→execution paths
+- Session label fix: Markets Closed shown correctly when enabled sessions are outside their hours
+- Active trade duplicate badge fix (chart page and active trades tab)
+
+## v0.22 — Bounce Generator & Real-Time Monitoring
+
+- TEST tab renamed to Bounce Generator
+- Signals section added to Trading > Strategy
+- Bounce Generator live execution through full MT5 pipeline
+- Real-time monitoring with 3-second velocity loop
+- Outcome check interval reduced to 5 seconds
+- Message detection latency reduced to ~18 ms
+
+## v0.21 — Performance Improvements
+
+- MT5 bridge persistent HTTP connection (~1.5ms round-trip)
+- Adaptive monitor loop: 1-second polling when trades open
+- Pre-fetch tick before order placement
+- Telegram latency improvements (ConnectionTcpAbridged)
+- TG Learning mode for signal scoring
+
+## v0.2 — TEST Module (Claude Bounce Generator)
+
+- TEST tab with isolated Claude-powered signal generator
+- Virtual trading engine with 2% risk sizing
+- Isolated database (test_signal.db)
+- Post-trade learning notes and batch pattern analysis
+- Circuit breaker after 3 consecutive losses
+
+## v0.11 — Bug Fixes
+
+- Fixed MT5 broker UTC+3 timestamp offset
+- Signal parser edge cases for GD2 channel
+- Strategy handler improvements
+
+## v0.1 — Initial Beta Release
+
+- Core MT5 bridge integration via CrossOver/Wine on macOS
+- Telegram signal parsing for Gold Diggers VIP
+- Five trading strategies
+- Dynamic Position Management (DPM)
+- Telegram bot and daily email reports

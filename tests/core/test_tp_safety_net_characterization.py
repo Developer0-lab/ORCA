@@ -1,0 +1,97 @@
+"""Characterizes _tp_safety_net_sweep/_tp_safety_net_check_trade/
+_compute_be_cost_pts on SimulationEngine (core/engine.py) before task 020
+extracts them -- see docs/todo/refactor/core-tp-safety-net-migration/010-*.md.
+
+Uses a fake bridge. ea_bridge.get_instance() is faked -- real, external
+infrastructure. NO real or demo MT5 order is ever placed, closed, or
+modified -- verified via the fake's own call log.
+"""
+import asyncio
+import os
+import tempfile
+import time
+from types import SimpleNamespace
+from unittest import mock
+
+import pytest
+
+from backend.src.services.positions import safety_net as core_tp_safety_net
+from backend.src.db import database as db
+from backend.src.services.broker import ea_bridge as ea_bridge
+from backend.src.runtime import TradingRuntime
+
+
+class _FakeBridge:
+    def __init__(self, candles=None, modify_result=None, tick=None):
+        self._candles = candles if candles is not None else []
+        self._modify_result = modify_result or {"success": True}
+        self._tick = tick or SimpleNamespace(bid=2400.0, ask=2400.5)
+        self.modify_order_calls = []
+
+    async def get_candles_range(self, start, end, tf):
+        return self._candles
+
+    async def modify_order(self, ticket, sl=None, tp=None):
+        self.modify_order_calls.append({"ticket": ticket, "sl": sl, "tp": tp})
+        return self._modify_result
+
+    async def get_tick(self):
+        return self._tick
+
+
+@pytest.fixture
+def engine(fresh_db):
+    e = TradingRuntime.__new__(TradingRuntime)
+    e._bridge = _FakeBridge()
+    e._tp_safety_net_last_alert = {}
+    return e
+
+
+def _trade(strategy="scale_out", sl_moved_to_be=0, managed_by="python", tp1=2410.0,
+          tp2=None, open_time=None, entry_price=2400.0, direction="BUY",
+          mt5_ticket=555, trade_id="t-1"):
+    return {
+        "trade_id": trade_id, "strategy": strategy, "sl_moved_to_be": sl_moved_to_be,
+        "managed_by": managed_by, "tp1": tp1, "tp2": tp2,
+        "open_time": open_time if open_time is not None else time.time() - 100,
+        "entry_price": entry_price, "direction": direction, "mt5_ticket": mt5_ticket,
+    }
+
+
+def _insert_trade_row(trade_id="t-1", mt5_ticket=555, stop_loss=2380.0, direction="BUY"):
+    with db.db() as conn:
+        conn.execute(
+            "INSERT INTO vantage_signals (signal_id, direction, entry_low, entry_high, "
+            "stop_loss, status, created_at) VALUES (?,?,?,?,?,?,?)",
+            (f"sig-{trade_id}", direction, 2400.0, 2400.0, stop_loss, "active", time.time()),
+        )
+        conn.execute(
+            "INSERT INTO vantage_simulated_trades (trade_id, signal_id, mt5_ticket, direction, "
+            "entry_low, entry_high, entry_price, lot_size, remaining_lots, stop_loss, status, "
+            "open_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (trade_id, f"sig-{trade_id}", mt5_ticket, direction, 2400.0, 2400.0, 2400.0,
+             0.10, 0.10, stop_loss, "open", time.time()),
+        )
+
+
+def _row(trade_id="t-1"):
+    with db.db() as conn:
+        return db.row_to_dict(
+            conn.execute(
+                "SELECT stop_loss, sl_moved_to_be FROM vantage_simulated_trades WHERE trade_id=?",
+                (trade_id,),
+            ).fetchone()
+        )
+
+
+def test_sweep_continues_past_per_trade_exception(fresh_db, engine):
+    calls = []
+    async def fake_check(trade, now, bridge, last_alert):
+        calls.append(trade["trade_id"])
+        if trade["trade_id"] == "bad":
+            raise RuntimeError("boom")
+    with mock.patch.object(core_tp_safety_net, "get_open_trades",
+                           return_value=[{"trade_id": "bad"}, {"trade_id": "good"}]), \
+         mock.patch.object(core_tp_safety_net, "tp_safety_net_check_trade", side_effect=fake_check):
+        asyncio.run(TradingRuntime._tp_safety_net_sweep(engine))
+    assert calls == ["bad", "good"]

@@ -1,0 +1,771 @@
+"""Proves backend.src.services.signals.resolution's extracted function
+behaves identically to the front half of SimulationEngine.
+open_trade_from_signal, characterized in
+test_signal_resolution_characterization.py -- see
+docs/todo/refactor/core-signal-resolution-migration/020-*.md.
+
+Unlike 010 (which had to read resolved values off a fake bridge's
+place_order call log, since the split didn't exist in engine.py), these
+tests call resolve_open_trade_params() directly and assert on its returned
+dict -- a more direct equivalent now that the split actually exists.
+"""
+import asyncio
+import os
+import tempfile
+import time
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+from backend.src.db import database as db
+from backend.src.services.signals import resolution as sr
+from backend.src.services.risk import strategy_params as sp
+from backend.src.utils.models import (
+    STRATEGY_SCALE_OUT, STRATEGY_NO_SL_SCALE, STRATEGY_CONSERVATIVE,
+    STRATEGY_SCALP_RUNNER, STRATEGY_CONSERVATIVE_TRIAL, STRATEGY_TRAIL_STOP,
+    STRATEGY_SIGNAL_CLIMBER, STRATEGY_REVERSAL_RUNNER, STRATEGY_ADAPTIVE_RUNNER,
+    STRATEGY_ADAPTIVE_RUNNER_2,
+)
+
+
+def _reset_thread_local_connection():
+    conn = getattr(db._thread_local, "conn", None)
+    if conn is not None:
+        conn.close()
+        del db._thread_local.conn
+    if hasattr(db._thread_local, "depth"):
+        del db._thread_local.depth
+
+
+def _reset_db_worker_thread_connection():
+    db._db_executor.submit(_reset_thread_local_connection).result()
+
+
+@pytest.fixture
+def fresh_db():
+    _reset_thread_local_connection()
+    _reset_db_worker_thread_connection()
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    db.init(path)
+    db._rs_cache = None
+    db._rs_cache_ts = 0.0
+    sp._cache.clear()
+    yield db
+    sp._cache.clear()
+    _reset_thread_local_connection()
+    _reset_db_worker_thread_connection()
+    os.remove(path)
+
+
+class _FakeBridge:
+    def __init__(self, tick="default", account=None):
+        self._tick = _default_tick() if tick == "default" else tick
+        self._account = account if account is not None else {"balance": 0}
+
+    async def get_tick(self):
+        return self._tick
+
+    async def get_account(self):
+        return self._account
+
+
+def _default_tick():
+    return SimpleNamespace(bid=2399.8, ask=2400.2, spread_points=4.0)
+
+
+def _insert_signal(sig_id="sig-1", direction="BUY", entry_low=2399.0, entry_high=2401.0,
+                   stop_loss=2390.0, tp1=2410.0, status="pending", source_name="TestChannel",
+                   lot_size=None, risk_pct=None):
+    with db.db() as conn:
+        conn.execute(
+            "INSERT INTO vantage_signals (signal_id, source_name, direction, entry_low, "
+            "entry_high, stop_loss, tp1, status, created_at, lot_size, risk_pct) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (sig_id, source_name, direction, entry_low, entry_high, stop_loss, tp1,
+             status, time.time(), lot_size, risk_pct),
+        )
+
+
+def _set_channel_perf(source, lot_mult=1.0, paused=0):
+    with db.db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_performance (source, lot_mult, paused) "
+            "VALUES (?,?,?)",
+            (source, lot_mult, paused),
+        )
+
+
+# ── gates ──────────────────────────────────────────────────────────────────────
+
+def test_raises_when_signal_not_found(fresh_db):
+    bridge = _FakeBridge()
+    with pytest.raises(ValueError, match="not found"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "does-not-exist"))
+
+
+def test_raises_when_signal_wrong_status(fresh_db):
+    _insert_signal(status="closed")
+    bridge = _FakeBridge()
+    with pytest.raises(ValueError, match="cannot open"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+def test_raises_when_circuit_breaker_active(fresh_db):
+    _insert_signal()
+    db.update_risk_settings({
+        "circuit_breaker_enabled": 1,
+        "circuit_breaker_active_until": time.time() + 3600,
+    })
+    bridge = _FakeBridge()
+    with pytest.raises(ValueError, match="Circuit breaker"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+def test_raises_when_session_not_allowed(fresh_db):
+    _insert_signal()
+    db.update_risk_settings({
+        "session_asia_enabled": 0, "session_london_enabled": 0, "session_ny_enabled": 0,
+    })
+    bridge = _FakeBridge()
+    with pytest.raises(ValueError, match="Trading session"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+def test_raises_when_pretrade_filter_blocks_bad_rr(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2390.0, tp1=2401.0)
+    bridge = _FakeBridge()
+    with pytest.raises(ValueError, match="R:R"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+def test_raises_when_price_outside_entry_zone(fresh_db):
+    _insert_signal(direction="BUY", entry_low=2399.0, entry_high=2401.0)
+    bridge = _FakeBridge(tick=SimpleNamespace(bid=2404.8, ask=2405.2, spread_points=4.0))
+    with pytest.raises(ValueError, match="entry zone"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+def test_raises_when_spread_too_wide(fresh_db):
+    _insert_signal()
+    db.update_fee_settings({"max_allowed_spread_points": 2.0})
+    bridge = _FakeBridge(tick=SimpleNamespace(bid=2399.8, ask=2400.2, spread_points=4.0))
+    with pytest.raises(ValueError, match="Spread too wide"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+def test_raises_when_channel_paused(fresh_db):
+    _insert_signal(source_name="PausedChannel")
+    _set_channel_perf("PausedChannel", paused=1)
+    bridge = _FakeBridge()
+    with pytest.raises(ValueError, match="paused"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+def test_raises_when_outside_trading_schedule(fresh_db):
+    """Proves the gate is actually wired in, not just correct in isolation.
+    Enabled with every block left disabled -- blocks regardless of the
+    actual wall-clock time the test happens to run at."""
+    from backend.src.services.risk import schedule as sched
+    sched.set_trading_schedule_enabled(True)
+    sched.set_trading_schedule(sched._default_schedule())
+    _insert_signal()
+    bridge = _FakeBridge()
+    with pytest.raises(ValueError, match="Trading Schedule"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+# ── strategy resolution ────────────────────────────────────────────────────────
+
+def test_strategy_resolution_uses_channel_override(fresh_db):
+    _insert_signal(source_name="OverrideChannel")
+    db.set_channel_strategy_override("OverrideChannel", STRATEGY_TRAIL_STOP)
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["strategy"] == STRATEGY_TRAIL_STOP
+
+
+def test_strategy_resolution_uses_auto_rec(fresh_db):
+    """A stored rec is used when it is still something Auto may run. Auto's
+    vocabulary is EA templates + stand_down (2026-08-17), so the rec here is
+    a template -- this used to assert a built-in, which Auto can no longer
+    select."""
+    from backend.src.services.positions import core_auto_template as _auto
+    from backend.src.services.broker import ea_templates as et
+    _insert_signal(source_name="AutoChannel")
+    db.set_channel_strategy_override("AutoChannel", None, auto=True)
+    pick = _auto.auto_templates()[0]
+    et.save_ea_template(et.template_name_from_override(pick), {"mode": "grid"})
+    db.set_channel_strategy_rec("AutoChannel", pick, "reasoning", 0.9)
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["strategy"] == pick
+    assert result["is_template"] is True
+
+
+def test_auto_rec_naming_a_no_longer_valid_strategy_falls_back_to_the_baseline(fresh_db):
+    """Stored recs outlive the rules that produced them. When the built-ins
+    stopped being selectable, rows already holding one kept being traded --
+    GOLD DIGGERS INSTITUTIONAL ran limit_runner for nearly nine hours
+    afterwards, at the global 0.1 lot instead of its template's 0.05, because
+    only an EMPTY rec fell through to the baseline."""
+    from backend.src.services.positions import core_auto_template as _auto
+    from backend.src.services.broker import ea_templates as et
+    _insert_signal(source_name="AutoChannel")
+    db.set_channel_strategy_override("AutoChannel", None, auto=True)
+    for tpl in _auto.auto_templates():
+        et.save_ea_template(et.template_name_from_override(tpl), {"mode": "grid"})
+    db.set_channel_strategy_rec("AutoChannel", STRATEGY_SIGNAL_CLIMBER, "stale", 0.9)
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["strategy"] != STRATEGY_SIGNAL_CLIMBER
+    assert _auto.is_valid_auto_choice(result["strategy"])
+
+
+def test_auto_resolved_template_is_treated_as_a_template_like_a_pinned_one(fresh_db):
+    """_is_template used to key off the channel override, which for an Auto
+    channel is the literal "auto" -- so a template reaching resolution through
+    Auto was not recognised as one, and skipped the template's SL authority,
+    Sig Guard, and the guard that stops the global Fixed Lot Size overwriting
+    a template's own Anchor Lot. An Auto channel and a pinned channel on the
+    SAME template have to resolve it identically."""
+    from backend.src.services.positions import core_auto_template as _auto
+    from backend.src.services.broker import ea_templates as et
+    # An Auto-selectable template, since Auto only accepts its own vocabulary.
+    override = _auto.auto_templates()[0]
+    et.save_ea_template(et.template_name_from_override(override),
+                        {"mode": "grid", "sl_pips": 40.0})
+
+    _insert_signal(sig_id="sig-pinned", source_name="PinnedChannel")
+    db.set_channel_strategy_override("PinnedChannel", override)
+    pinned = asyncio.run(sr.resolve_open_trade_params(_FakeBridge(), "sig-pinned"))
+
+    _insert_signal(sig_id="sig-auto", source_name="AutoTplChannel")
+    db.set_channel_strategy_override("AutoTplChannel", None, auto=True)
+    db.set_channel_strategy_rec("AutoTplChannel", override, "reasoning", 0.9)
+    auto_res = asyncio.run(sr.resolve_open_trade_params(_FakeBridge(), "sig-auto"))
+
+    assert pinned["is_template"] is True
+    assert auto_res["is_template"] is True, "Auto-resolved template not seen as a template"
+    assert auto_res["strategy"] == pinned["strategy"]
+    assert auto_res["stop_loss_to_use"] == pinned["stop_loss_to_use"], \
+        "template SL authority skipped on the Auto path"
+    assert auto_res["template"] is not None and pinned["template"] is not None
+
+
+def test_strategy_resolution_falls_back_to_global_default(fresh_db):
+    _insert_signal(source_name="PlainChannel")
+    db.update_risk_settings({"trade_strategy": STRATEGY_SCALE_OUT})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["strategy"] == STRATEGY_SCALE_OUT
+
+
+# ── EA Templates ─────────────────────────────────────────────────────────────
+
+def test_template_override_resolves_as_template_authoritative_sl(fresh_db):
+    from backend.src.services.broker import ea_templates as et
+    et.save_ea_template("Grid Stealth", {"mode": "grid", "tpsl_mode": "stealth"})
+    _insert_signal(source_name="TplChannel", stop_loss=2390.0)
+    db.set_channel_strategy_override("TplChannel", et.override_for_template("Grid Stealth"))
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["is_template"] is True
+    assert result["strategy"] == "template:Grid Stealth"
+    assert result["template"]["mode"] == "grid"
+    assert result["template"]["tpsl_mode"] == "stealth"
+    # A template's own sl_pips (DEFAULTS: 50.0, unset here) is as
+    # authoritative as its TP ladder -- it replaces the signal's own SL
+    # rather than deferring to it, same convention as tp{n}_pips. BUY,
+    # default tick ask=2400.2, sl_pips=50 -> 2400.2 - 5.0 = 2395.2. The
+    # signal's own stop_loss (2390.0) is NOT used.
+    assert result["stop_loss_to_use"] == 2395.2
+
+
+def test_template_missing_raises(fresh_db):
+    _insert_signal(source_name="TplChannel")
+    db.set_channel_strategy_override("TplChannel", "template:DoesNotExist")
+    bridge = _FakeBridge()
+    with pytest.raises(ValueError, match="no longer exists"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+def test_template_sig_guard_blocks_when_trade_already_open(fresh_db):
+    from backend.src.services.broker import ea_templates as et
+    et.save_ea_template("Guarded", {"sig_guard": True})
+    _insert_signal(sig_id="other-sig", source_name="GuardChannel", direction="BUY")
+    _insert_signal(source_name="GuardChannel", direction="BUY")
+    db.set_channel_strategy_override("GuardChannel", et.override_for_template("Guarded"))
+    with db.db() as conn:
+        conn.execute(
+            "INSERT INTO vantage_simulated_trades (trade_id, signal_id, direction, entry_low, "
+            "entry_high, entry_price, lot_size, remaining_lots, stop_loss, status, open_time, "
+            "strategy, tg_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("existing-1", "other-sig", "BUY", 2400.0, 2400.0, 2400.0, 0.10, 0.10, 2390.0,
+             "open", time.time(), "template:Guarded", "GuardChannel"),
+        )
+    bridge = _FakeBridge()
+    with pytest.raises(ValueError, match="Sig Guard"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+def test_template_sig_guard_off_does_not_block(fresh_db):
+    from backend.src.services.broker import ea_templates as et
+    et.save_ea_template("Unguarded", {"sig_guard": False})
+    _insert_signal(sig_id="other-sig", source_name="GuardChannel", direction="BUY")
+    _insert_signal(source_name="GuardChannel", direction="BUY")
+    db.set_channel_strategy_override("GuardChannel", et.override_for_template("Unguarded"))
+    with db.db() as conn:
+        conn.execute(
+            "INSERT INTO vantage_simulated_trades (trade_id, signal_id, direction, entry_low, "
+            "entry_high, entry_price, lot_size, remaining_lots, stop_loss, status, open_time, "
+            "strategy, tg_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("existing-1", "other-sig", "BUY", 2400.0, 2400.0, 2400.0, 0.10, 0.10, 2390.0,
+             "open", time.time(), "template:Unguarded", "GuardChannel"),
+        )
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["is_template"] is True
+    assert result["strategy"] == "template:Unguarded"
+
+
+# ── lot sizing ─────────────────────────────────────────────────────────────────
+
+def test_lot_size_override_used_verbatim(fresh_db):
+    _insert_signal()
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1", lot_size_override=0.25))
+    assert result["lot_size"] == 0.25
+
+
+def test_lot_size_from_signal_when_no_override(fresh_db):
+    _insert_signal(lot_size=0.33)
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["lot_size"] == 0.33
+
+
+def test_lot_size_risk_based_when_neither_set(fresh_db):
+    _insert_signal()
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["lot_size"] > 0
+
+
+def test_lot_size_channel_multiplier_applied(fresh_db):
+    _insert_signal(source_name="BoostedChannel", lot_size=0.10)
+    _set_channel_perf("BoostedChannel", lot_mult=2.0)
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["lot_size"] == 0.20
+
+
+def test_lot_size_channel_multiplier_skipped_for_manual_override(fresh_db):
+    _insert_signal(source_name="BoostedChannel")
+    _set_channel_perf("BoostedChannel", lot_mult=2.0)
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1", lot_size_override=0.10))
+    assert result["lot_size"] == 0.10
+
+
+def test_strategy_fixed_lot_wins_over_everything(fresh_db):
+    _insert_signal(lot_size=0.10)
+    db.update_risk_settings({"strategy_lot_size": 0.77})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1", lot_size_override=0.10))
+    assert result["lot_size"] == 0.77
+
+
+def test_template_uses_lot_anchor_for_sizing(fresh_db):
+    """A template's own Entries & Lots field is authoritative, not the
+    generic risk-based path every other strategy uses. Regression for the
+    gap where single-mode templates (and the DB/Telegram record of any
+    template trade) got the generic size instead of the configured Anchor
+    Lot -- grid mode's resting legs happened to be correct already since
+    the EA itself overrides with tpl_lot_anchor/tpl_lot_pending, but the
+    Python-side value fed to open_trade() was never actually derived from
+    the template."""
+    from backend.src.services.broker import ea_templates as et
+    et.save_ea_template("SizedTpl", {"lot_anchor": 0.05, "risk_pct": 0})
+    _insert_signal(source_name="TplChannel")
+    db.set_channel_strategy_override("TplChannel", et.override_for_template("SizedTpl"))
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["lot_size"] == 0.05
+
+
+def test_template_lot_anchor_not_scaled_by_channel_multiplier(fresh_db):
+    """A template's fixed Anchor Lot is a deliberate manual value, same as
+    lot_size_override -- the channel scorecard's rolling-performance
+    multiplier must not scale it. Regression for Reversal Engine's
+    real-world 1.3x multiplier turning a configured 0.1 Anchor Lot into
+    0.13 on a live trade (ticket 1687672591): the channel-multiplier
+    exemption only checked lot_size_override, not the template-fixed path a
+    few lines above it."""
+    from backend.src.services.broker import ea_templates as et
+    et.save_ea_template("BoostedTpl", {"lot_anchor": 0.10, "risk_pct": 0})
+    _insert_signal(source_name="BoostedChannel")
+    _set_channel_perf("BoostedChannel", lot_mult=1.3)
+    db.set_channel_strategy_override("BoostedChannel", et.override_for_template("BoostedTpl"))
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["lot_size"] == 0.10
+
+
+def test_template_risk_pct_sizing_still_scaled_by_channel_multiplier(fresh_db):
+    """Unlike the fixed Anchor Lot, a template's risk_pct branch is
+    genuinely risk-derived -- same as the generic non-template path -- so
+    the channel multiplier is meant to keep applying there."""
+    from backend.src.services.broker import ea_templates as et
+    et.save_ea_template("RiskBoostedTpl", {"lot_anchor": 0.05, "risk_pct": 1.0})
+    _insert_signal(source_name="BoostedChannel", stop_loss=2390.0)
+    _set_channel_perf("BoostedChannel", lot_mult=2.0)
+    db.set_channel_strategy_override("BoostedChannel", et.override_for_template("RiskBoostedTpl"))
+    bridge = _FakeBridge(account={"balance": 10000.0})
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    # entry ~2400, SL 2390 -> 10pt distance; 1% of 10000 = $100 risk -> 0.10
+    # lot unscaled (see test_template_risk_pct_sizes_from_risk_instead_of_lot_anchor),
+    # x2.0 channel multiplier -> 0.20.
+    assert result["lot_size"] == 0.20
+
+
+def test_template_lot_anchor_capped_by_max_lot_size(fresh_db):
+    """Global parameters still apply as a ceiling even though the
+    template's fixed lot is the primary sizing source."""
+    from backend.src.services.broker import ea_templates as et
+    et.save_ea_template("BigTpl", {"lot_anchor": 5.0, "risk_pct": 0})
+    _insert_signal(source_name="TplChannel")
+    db.set_channel_strategy_override("TplChannel", et.override_for_template("BigTpl"))
+    db.update_risk_settings({"max_lot_size": 0.10})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["lot_size"] == 0.10
+
+
+def test_template_risk_pct_sizes_from_risk_instead_of_lot_anchor(fresh_db):
+    """risk_pct (0 = OFF) lets a template size from account risk instead
+    of a flat lot -- the same convention every other strategy's own
+    risk_pct field already follows."""
+    from backend.src.services.broker import ea_templates as et
+    et.save_ea_template("RiskTpl", {"lot_anchor": 0.05, "risk_pct": 1.0})
+    _insert_signal(source_name="TplChannel", stop_loss=2390.0)
+    db.set_channel_strategy_override("TplChannel", et.override_for_template("RiskTpl"))
+    bridge = _FakeBridge(account={"balance": 10000.0})
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    # entry ~2400, SL 2390 -> 10pt distance; 1% of 10000 = $100 risk -> 0.10 lot
+    assert result["lot_size"] != 0.05
+    assert result["lot_size"] > 0.05
+
+
+def test_template_global_fixed_lot_does_not_override_lot_anchor(fresh_db):
+    """The global fixed-lot toggle must not silently overwrite a
+    template's own Anchor Lot -- that would defeat the entire point of
+    the field existing on the template. Every other (non-template)
+    strategy keeps "fixed lot always wins" (see
+    test_strategy_fixed_lot_wins_over_everything)."""
+    from backend.src.services.broker import ea_templates as et
+    et.save_ea_template("FixedLotTpl", {"lot_anchor": 0.03, "risk_pct": 0})
+    _insert_signal(source_name="TplChannel")
+    db.set_channel_strategy_override("TplChannel", et.override_for_template("FixedLotTpl"))
+    db.update_risk_settings({"strategy_lot_size": 0.77})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["lot_size"] == 0.03
+
+
+def test_template_manual_lot_override_still_wins(fresh_db):
+    """An explicit manual override (e.g. the "Open Trade Now" UI lot
+    field) still wins over the template's Anchor Lot -- the user set it
+    deliberately for this one trade."""
+    from backend.src.services.broker import ea_templates as et
+    et.save_ea_template("OverrideTpl", {"lot_anchor": 0.03, "risk_pct": 0})
+    _insert_signal(source_name="TplChannel")
+    db.set_channel_strategy_override("TplChannel", et.override_for_template("OverrideTpl"))
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1", lot_size_override=0.42))
+    assert result["lot_size"] == 0.42
+
+
+def test_age_lot_mult_decay_applied(fresh_db):
+    _insert_signal(lot_size=0.10)
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1", age_lot_mult=0.5))
+    assert result["lot_size"] == 0.05
+
+
+def test_age_lot_mult_skipped_for_manual_override(fresh_db):
+    _insert_signal()
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(
+        bridge, "sig-1", lot_size_override=0.10, age_lot_mult=0.5))
+    assert result["lot_size"] == 0.10
+
+
+# ── per-strategy pre-fill SL ───────────────────────────────────────────────────
+
+def test_scale_out_uses_signal_sl_unchanged(fresh_db):
+    _insert_signal(stop_loss=2390.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_SCALE_OUT})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2390.0
+
+
+def test_no_sl_scale_widens_sl_without_dpm_candles(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2390.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_NO_SL_SCALE})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1", dpm_candles=None))
+    assert result["stop_loss_to_use"] == 2385.0
+
+
+def test_no_sl_scale_blocks_when_adx_below_30(fresh_db):
+    _insert_signal()
+    db.update_risk_settings({"trade_strategy": STRATEGY_NO_SL_SCALE})
+    bridge = _FakeBridge()
+    with patch("backend.src.services.dpm.engine.compute_adx", return_value=15.0):
+        with pytest.raises(ValueError, match="ADX"):
+            asyncio.run(sr.resolve_open_trade_params(
+                bridge, "sig-1", dpm_candles=[{"h": 1, "l": 1, "c": 1}]))
+
+
+def test_no_sl_scale_allows_when_adx_above_30(fresh_db):
+    _insert_signal()
+    db.update_risk_settings({"trade_strategy": STRATEGY_NO_SL_SCALE})
+    bridge = _FakeBridge()
+    with patch("backend.src.services.dpm.engine.compute_adx", return_value=35.0):
+        result = asyncio.run(sr.resolve_open_trade_params(
+            bridge, "sig-1", dpm_candles=[{"h": 1, "l": 1, "c": 1}]))
+    assert result["strategy"] == STRATEGY_NO_SL_SCALE
+
+
+def test_conservative_uses_fixed_proxy_sl(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_CONSERVATIVE})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2395.0
+
+
+def test_scalp_runner_uses_fixed_proxy_sl(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_SCALP_RUNNER})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2390.0
+
+
+def test_conservative_trial_uses_lot_derived_proxy_sl(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, lot_size=0.10)
+    db.update_risk_settings({"trade_strategy": STRATEGY_CONSERVATIVE_TRIAL})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2390.0
+
+
+def test_trail_stop_uses_configured_sl_pts(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_TRAIL_STOP, "trail_stop_sl_pts": 6.0})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2394.0
+
+
+def test_signal_climber_uses_signal_sl_exactly(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2385.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_SIGNAL_CLIMBER})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2385.0
+
+
+def test_reversal_runner_widens_sl(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2395.0, tp1=None)
+    db.update_risk_settings({"trade_strategy": STRATEGY_REVERSAL_RUNNER})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2380.0
+
+
+def test_adaptive_runner_widens_and_caps_sl(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2395.0, tp1=2410.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_ADAPTIVE_RUNNER})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2395.0
+
+
+def test_adaptive_runner_2_uses_fixed_10pt_sl_ignoring_signal_sl(fresh_db):
+    # entry_mid = 2400.0; signal's own stop_loss (2350.0, 50pts away) must be
+    # completely ignored -- only the fixed 10pt distance matters.
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2350.0, tp1=2410.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_ADAPTIVE_RUNNER_2})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2390.0
+
+
+def test_adaptive_runner_2_sell_direction_sl_is_above_entry(fresh_db):
+    _insert_signal(direction="SELL", entry_low=2399.0, entry_high=2401.0,
+                   stop_loss=2450.0, tp1=2390.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_ADAPTIVE_RUNNER_2})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2410.0
+
+
+# ── Live strategy-parameter overrides (Trading > Strategy > Strategy
+# Parameters, core_strategy_params.py) actually reach resolve_open_trade_
+# params() -- these are the exact code paths a user editing that panel
+# would be changing. ──────────────────────────────────────────────────────
+
+def test_conservative_sl_pt_override_changes_resolved_sl(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2390.0, tp1=2410.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_CONSERVATIVE})
+    sp.set_strategy_params(STRATEGY_CONSERVATIVE, {"sl_pt": 8.0, "tp1_pt": 3.0})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2392.0   # entry_mid 2400 - 8
+
+
+def test_scalp_runner_sl_pt_override_changes_resolved_sl(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2390.0, tp1=2410.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_SCALP_RUNNER})
+    sp.set_strategy_params(STRATEGY_SCALP_RUNNER, {"sl_pt": 15.0, "tp1_pt": 3.0, "tp2_pt": 4.0})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2385.0   # entry_mid 2400 - 15
+
+
+def test_reversal_runner_sl_mult_override_changes_widened_sl(fresh_db):
+    # stated_dist = |2400 - 2395| = 5; default 4x -> 20, capped at 20pt = 20.
+    # With sl_mult overridden to 2x: min(5*2, cap) = 10.
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2395.0, tp1=None)
+    db.update_risk_settings({"trade_strategy": STRATEGY_REVERSAL_RUNNER})
+    sp.set_strategy_params(STRATEGY_REVERSAL_RUNNER, {"sl_mult": 2.0, "sl_cap_pt": 20.0, "sl_floor_pt": 8.0})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2390.0   # entry_mid 2400 - 10
+
+
+def test_reversal_runner_sl_floor_override_used_for_bad_data(fresh_db):
+    # stop_loss == entry (stated_dist=0) triggers the floor fallback.
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2400.0, tp1=None)
+    db.update_risk_settings({"trade_strategy": STRATEGY_REVERSAL_RUNNER})
+    sp.set_strategy_params(STRATEGY_REVERSAL_RUNNER, {"sl_mult": 4.0, "sl_cap_pt": 20.0, "sl_floor_pt": 3.0})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2397.0   # entry_mid 2400 - floor 3
+
+
+def test_adaptive_runner_tp_cap_frac_override_tightens_sl(fresh_db):
+    # stated_dist=5, final_tp_dist=50 (tp1=2450, entry_mid=2400).
+    # Default: widened=min(20,20)=20, tp_cap=50*0.5=25 -> min(20,25)=20.
+    # With tp_cap_frac=0.10: tp_cap=5 -> max(stated=5, min(20,5))=5.
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2395.0, tp1=2450.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_ADAPTIVE_RUNNER})
+    sp.set_strategy_params(
+        STRATEGY_ADAPTIVE_RUNNER,
+        {"sl_mult": 4.0, "sl_cap_pt": 20.0, "sl_floor_pt": 8.0, "tp_cap_frac": 0.10},
+    )
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2395.0   # entry_mid 2400 - 5
+
+
+def test_adaptive_runner_2_sl_pt_override_changes_resolved_sl(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2350.0, tp1=2410.0)
+    db.update_risk_settings({"trade_strategy": STRATEGY_ADAPTIVE_RUNNER_2})
+    sp.set_strategy_params(STRATEGY_ADAPTIVE_RUNNER_2, {"sl_pt": 20.0})
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["stop_loss_to_use"] == 2380.0   # entry_mid 2400 - 20
+
+
+# ── Risk Governor integration ───────────────────────────────────────────────────
+
+def test_risk_governor_blocks_when_enabled_and_unsafe(fresh_db):
+    _insert_signal(entry_low=2399.0, entry_high=2401.0, stop_loss=2350.0, tp1=2440.0)
+    db.update_risk_settings({"risk_governor_enabled": 1})
+    bridge = _FakeBridge()
+    with pytest.raises(ValueError, match="Risk Governor blocked"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+def test_risk_governor_overrides_lot_size_when_allowed(fresh_db):
+    _insert_signal(lot_size=0.10, tp1=2415.0)
+    db.update_risk_settings({
+        "risk_governor_enabled": 1, "risk_per_trade_pct": 5.0, "max_risk_per_trade_pct": 5.0,
+        "max_lot_size": 0.02,
+    })
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["lot_size"] == 0.02
+
+
+def test_risk_governor_yields_to_strategy_fixed_lot(fresh_db):
+    _insert_signal(lot_size=0.10, tp1=2415.0)
+    db.update_risk_settings({
+        "risk_governor_enabled": 1, "risk_per_trade_pct": 5.0, "max_risk_per_trade_pct": 5.0,
+        "max_lot_size": 0.02, "strategy_lot_size": 0.15,
+    })
+    bridge = _FakeBridge()
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["lot_size"] == 0.15
+
+
+# ── Grid templates are exempt from the entry-zone check (2026-07-28) ─────
+# A grid template is a pending-order strategy by construction -- its resting
+# legs span the zone (core_open_trade.py's zone_low/zone_high handoff), so
+# unlike every market-fill strategy above, price is NOT required to already
+# be inside it. Without this, a grid template signal could never be manually
+# fired (e.g. the "Open Trade Now" button) until price happened to already
+# be back in its zone.
+
+def test_grid_template_bypasses_entry_zone_check(fresh_db):
+    from backend.src.services.broker import ea_templates as et
+    et.save_ea_template("GridTpl", {"mode": "grid"})
+    _insert_signal(source_name="GridChannel", direction="BUY",
+                    entry_low=2399.0, entry_high=2401.0)
+    db.set_channel_strategy_override("GridChannel", et.override_for_template("GridTpl"))
+    # Price well outside the zone -- would raise for any other strategy
+    # (see test_raises_when_price_outside_entry_zone above).
+    bridge = _FakeBridge(tick=SimpleNamespace(bid=2450.0, ask=2450.4, spread_points=4.0))
+    result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["is_template"] is True
+    assert result["template"]["mode"] == "grid"
+
+
+def test_single_mode_template_still_enforces_entry_zone(fresh_db):
+    # Only grid mode is exempt -- single mode is a market-fill strategy like
+    # any other and must still wait for price to be in the zone.
+    from backend.src.services.broker import ea_templates as et
+    et.save_ea_template("SingleTpl", {"mode": "single"})
+    _insert_signal(source_name="SingleChannel", direction="BUY",
+                    entry_low=2399.0, entry_high=2401.0)
+    db.set_channel_strategy_override("SingleChannel", et.override_for_template("SingleTpl"))
+    bridge = _FakeBridge(tick=SimpleNamespace(bid=2450.0, ask=2450.4, spread_points=4.0))
+    with pytest.raises(ValueError, match="entry zone"):
+        asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+def test_news_blackout_blocks_resolution(fresh_db):
+    """The shared gate: everything automated that reaches this function --
+    Telegram channels and both engines -- is held during a news window."""
+    _insert_signal()
+    bridge = _FakeBridge()
+    with patch.object(
+        sr, "check_news_blackout",
+        return_value=(False, "News blackout — Non-Farm Employment Change (USD), resumes in 40 min"),
+    ):
+        with pytest.raises(ValueError, match="News blackout"):
+            asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+
+
+def test_no_news_window_resolves_normally(fresh_db):
+    _insert_signal()
+    bridge = _FakeBridge()
+    with patch.object(sr, "check_news_blackout", return_value=(True, "")):
+        result = asyncio.run(sr.resolve_open_trade_params(bridge, "sig-1"))
+    assert result["strategy"]

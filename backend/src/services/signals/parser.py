@@ -1,0 +1,719 @@
+"""
+Gold signal parsers — extracted verbatim from the original service.py.
+Supports two Telegram channel formats.
+"""
+
+import json
+import logging
+import re
+from typing import Optional
+
+# Re-exported so every existing caller keeps importing these from parser.
+from backend.src.services.signals._tp_autocorrect import _autocorrect_tps  # noqa: F401
+from backend.src.services.signals._learned_rules import (  # noqa: F401
+    apply_learned_rule,
+    apply_sl_adjustment_rule,
+    check_sl_adjustment_rules,
+    parse_with_learned_rules,
+)
+
+_log = logging.getLogger(__name__)
+
+# Currency guard — capture a wider token (allows "XAU/USD", "XAU-USD") and
+# strip separators before comparing, so a slash/dash in the ticker doesn't
+# truncate the captured group to just "XAU" and wrongly reject a real
+# XAUUSD signal.
+_CURRENCY_RE = re.compile(r'Currency[\s\xa0]*:[\s\xa0]*([\w/\-]+)', re.IGNORECASE)
+
+# Format A: "Sell Gold 4520 - 4512"
+_DIRECTION_RE   = re.compile(r'\b(buy|sell)\s+gold\s+([\d.,]+)\s*[-–—]\s*([\d.,]+)', re.IGNORECASE)
+# Format B: "Direction  SELL" + "ENTRY : 4468-4466" — colon after "Direction"
+# is optional since GD VIP has sent it both with and without one.
+_DIRECTION_B_RE = re.compile(r'Direction[\s\xa0]*:?[\s\xa0]+(BUY|SELL)', re.IGNORECASE)
+# Dash/en-dash/em-dash/slash or the word "to" between the two entry prices.
+_RANGE_SEP = r'[\s\xa0]*(?:[-–—/]|to)[\s\xa0]*'
+_ENTRY_B_RE     = re.compile(r'ENTRY[\s\xa0]*:?[\s\xa0]*([\d.,]+)' + _RANGE_SEP + r'([\d.,]+)', re.IGNORECASE)
+# Stop loss — colon after "Stop Loss" (full words) is optional, matching the
+# same optional-colon tolerance as Direction/ENTRY above.
+_SL_RE   = re.compile(r'stop[\s\xa0]*loss[\s\xa0]*:?[\s\xa0]+([\d.,]+)', re.IGNORECASE)
+_SL_B_RE = re.compile(r'\bSL[\s\xa0]*:?[\s\xa0]*([\d.,]+)', re.IGNORECASE)
+# TPs — colon or dash before the number, both optional.
+_TP_RE     = re.compile(r'TP(\d+)[\s\xa0]+([\d.,]+)', re.IGNORECASE)
+_TP_B_RE   = re.compile(r'TP(\d+)[\s\xa0]*[:\-][\s\xa0]*([\d.,]+)', re.IGNORECASE)
+_TPOPEN_RE = re.compile(r'TP(\d)\s+Open\s*\(([\d.,/\s]+)\)', re.IGNORECASE)
+
+# Format C: Gold Diggers 2.0 — "XAU USD BUY NOW" / "XAUUSD BUY NOW"
+# "NOW" is optional: GD2 sometimes omits it in the initial message.
+_GD2_DIRECTION_RE    = re.compile(r'XAU\s*USD\s+(BUY|SELL)(?:\s+NOW)?\b', re.IGNORECASE)
+_GD2_ENTRY_RANGE_RE  = re.compile(r'([\d.,]+)\s*[-–—]\s*([\d.,]+)')
+_GD2_ENTRY_SINGLE_RE = re.compile(r'\b(\d[\d.,]*)\b')  # fallback: first price-like number
+_GD2_TP_RE           = re.compile(r'TP(\d+)[\s\xa0]*:?[\s\xa0]+([\d.,]+)', re.IGNORECASE)
+_GD2_SL_RE           = re.compile(r'(?:🚫\s*)?SL[\s\xa0]*:?[\s\xa0]+([\d.,]+)', re.IGNORECASE)
+
+# Format C2: Gold Diggers 2.0's newer "Zone"/"Gold" layout (introduced
+# 2026-07-06 as "Zone"; "Gold" wording confirmed live 2026-07-08 from the
+# "GOLD DIGGERS 2.0 ⚡️" channel — same structure, different trigger noun,
+# missed several signals before this was added since neither variant matched
+# the older XAU USD gate) —
+#   "Buy Zone Now" / "Sell Zone Now"  (or "Buy Gold Now" / "Sell Gold Now")
+#   4163.5 - 4158.5
+#   Targets
+#   4165.5
+#   4167.5
+#   4170
+#   SL/ invalid 4155.5
+# TPs are bare numbers, one per line, under a "Targets" header — no "TP1:"
+# prefix like the older format — and SL uses "SL/ invalid <price>" instead
+# of "SL: <price>". Coexists with the older XAU USD BUY/SELL format; both
+# are tried by parse_gd2_signal/parse_gd2_partial so channel format changes
+# don't need call-site changes anywhere else.
+#   Target        <- singular header seen live too, alongside "Targets"
+#   4063
+#   4065
+#   4067
+# "Now" is required for the "Gold" noun (never optional, unlike "Zone") since
+# Format A's own gate is literally "buy/sell gold <price> - <price>"
+# (_DIRECTION_RE above) — without requiring "Now" here, "Sell Gold 4520 -
+# 4512" would incorrectly satisfy this gate too for any 'auto'-format channel.
+# "Buy/Sell Zone" alone (no "Now") also matches here via .search() even when
+# preceded by other words -- e.g. "Next Buy Zone" (Gold Diggers Scalping,
+# added 2026-07-24) -- since \b(Buy|Sell) only anchors the start of that
+# word, not the start of the message.
+_GD2_ZONE_DIRECTION_RE = re.compile(r'\b(Buy|Sell)\s+(?:Zone(?:\s+Now)?|Gold\s+Now)\b', re.IGNORECASE)
+_GD2_TARGETS_HEADER_RE = re.compile(r'Targets?\b', re.IGNORECASE)
+_GD2_TARGET_LINE_RE    = re.compile(r'^([\d.,]+)$')
+# SL/ invalid <price>" (original GD2 wording) or plain "SL <price>"/"SL: <price>"
+# (Gold Diggers Scalping's "Next Buy Zone" layout, added 2026-07-24 -- was
+# previously only matched by _GD2_SL_RE, which this is_zone branch never
+# tried, so these messages fell through to parse_gd2_partial forever instead
+# of ever completing as a real signal).
+_GD2_SL_ZONE_RE        = re.compile(
+    r'SL[\s\xa0]*(?:/[\s\xa0]*invalid)?[\s\xa0]*:?[\s\xa0]+([\d.,]+)', re.IGNORECASE
+)
+
+# Format C3: Gold Diggers 2.0's "BUY [LIMITS] GOLD @ xxxx/yyyy AREA" layout
+# (confirmed live 2026-07-09 — multiple signals using this wording).
+#   "BUY LIMITS GOLD @ 4073/4067 AREA"  or  "BUY GOLD @ 4108/4103"
+#   TP 4076                   ← bare "TP <price>", no TP1/TP2 numbering
+#   TP 4080
+#   TP 4085
+#   TP OPEN                   ← filler — skipped (not a number)
+#   SL 4066
+# Entry range is slash-separated (high/low for BUY, low/high for SELL).
+# TPs use a "TP <price>" prefix (no ordinal number). SL uses bare "SL <price>".
+# "LIMITS" is optional — "BUY GOLD @" also appears.
+# Requires "@" after GOLD to avoid conflicting with Format A ("Sell Gold 4520 - 4512").
+_GD2_LIMITS_DIRECTION_RE = re.compile(r'\b(BUY|SELL)\s+(?:LIMITS?\s+)?GOLD\s+@', re.IGNORECASE)
+_GD2_AT_RANGE_RE         = re.compile(r'@\s*([\d.,]+)\s*/\s*([\d.,]+)')
+_GD2_TP_PLAIN_RE         = re.compile(r'^TP\s+([\d.,]+)\s*$', re.IGNORECASE | re.MULTILINE)
+# A literal "TP OPEN" line — the final, unfixed-target leg that rides as a
+# runner once every numeric TP above it has closed its portion (see
+# core_limit_order_signal.py). Distinct from _GD2_TP_PLAIN_RE, which only
+# matches a numeric value and therefore never matches this line at all.
+_GD2_TP_OPEN_RE          = re.compile(r'^TP\s+OPEN\s*$', re.IGNORECASE | re.MULTILINE)
+
+
+def _parse_gd2_zone_targets(text: str, start: int = 0) -> dict[int, float]:
+    """Extract sequential TPs from a "Targets" section: one bare number per
+    line, in order, until the SL line. Non-numeric noise lines (blank, or
+    stray words like "Open" seen in some live messages) are skipped rather
+    than treated as a stop condition, since GD2's own formatting is
+    inconsistent about what appears between the last target and the SL."""
+    tps: dict[int, float] = {}
+    hm = _GD2_TARGETS_HEADER_RE.search(text, start)
+    if not hm:
+        return tps
+    n = 0
+    for line in text[hm.end():].splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.search(r'\bSL\b', stripped, re.IGNORECASE):
+            break
+        lm = _GD2_TARGET_LINE_RE.match(stripped)
+        if lm:
+            n += 1
+            if n <= 8:
+                tps[n] = _f(lm.group(1))
+        if n >= 8:
+            break
+    return tps
+
+
+def _parse_gd2_plain_tps(text: str) -> dict[int, float]:
+    """Extract sequential TPs from the Format C3 'TP <price>' layout.
+    Each line is 'TP 4076', 'TP 4080', etc. Lines like 'TP OPEN' are ignored
+    since _GD2_TP_PLAIN_RE only matches a numeric value after the TP prefix.
+    Returns {1: price1, 2: price2, ...} in match order."""
+    tps: dict[int, float] = {}
+    n = 0
+    for m in _GD2_TP_PLAIN_RE.finditer(text):
+        n += 1
+        if n <= 8:
+            tps[n] = _f(m.group(1))
+        if n >= 8:
+            break
+    return tps
+
+# Instant entry — "XAUUSD Buy Now" / "XAU Sell Now" / "XAU USD BUY NOW"
+# optionally followed by a limit price, e.g. "XAUUSD Buy Now 4293"
+# without SL/TP details; covered by Immediate Market Buy/Sell feature.
+# The price must start with a digit and end on one: `[\d.,]+` matched the
+# full stop in "XAUUSD BUY NOW." and float('.') raised on every rescan
+# (117 tracebacks on the VPS, 2026-09-28).
+_INSTANT_RE = re.compile(
+    r'\b(?:XAUUSD|XAU\s*USD|XAU)\s+(BUY|SELL)\s+NOW\b(?:[\s@,]*(\d+(?:[.,]\d+)*))?',
+    re.IGNORECASE,
+)
+
+# GD2 instant entry — "XAU USD BUY [NOW]" / "XAU USD SELL [NOW]"
+# "NOW" is optional: GD2 sometimes sends "XAU USD BUY" without it.
+_GD2_IME_RE = re.compile(
+    r'\bXAU\s*USD\s+(BUY|SELL)(?:\s+NOW)?\b',
+    re.IGNORECASE,
+)
+
+# Prefix that Channel 1 (Gold Diggers VIP) signals start with
+SIGNAL_PREFIX = "This is not financial advice. Use appropriate risk management if you're going to trade."
+
+
+def is_format_ab_signal(text: str, prefix: Optional[str] = None) -> bool:
+    """True if text plausibly is a Format A/B (Gold Diggers VIP) signal.
+
+    Previously gated on a strict, case-sensitive text.startswith(prefix) at
+    position 0 — a bolded disclaimer, a leading emoji, or any other
+    incidental formatting drift ahead of the disclaimer defeated that check
+    silently (no log, no "unrecognised" queue entry — the message just
+    vanished with no trace). This looks for the prefix as a case-insensitive
+    substring near the start of the message instead (tolerant of markdown
+    bold wrapping and a few leading characters), and falls back to the
+    signal's own structural markers (Direction + ENTRY, or "buy/sell gold")
+    when the disclaimer wording itself doesn't match at all — so a channel
+    tweaking its disclaimer text doesn't silently stop being read.
+    """
+    if not text:
+        return False
+    head = re.sub(r'\*+', '', text[:200])
+    key = (prefix or SIGNAL_PREFIX)[:40].lower()
+    if key in head.lower():
+        return True
+    return bool(_DIRECTION_B_RE.search(text) and _ENTRY_B_RE.search(text)) or \
+        bool(_DIRECTION_RE.search(text))
+
+
+def _f(s: str) -> float:
+    # A stray trailing full stop ("4284.5. - 4278.5", Gold Diggers Scalping,
+    # 2026-09-14) is read through, owner 2026-10-07 (handover 037, option B).
+    # Anything else that is not a number still raises.
+    t = str(s).replace(",", "").strip()
+    if t.endswith("."):
+        t = t[:-1]
+    return float(t)
+
+
+def parse_instant_entry(text: str) -> Optional[tuple]:
+    """
+    Detect an instant-entry message such as 'XAUUSD Buy Now' or 'XAU Sell Now 4293'.
+    Returns (direction, price) where price is a float or None (market).
+
+    Returns None if the message also contains SL or TP data — that makes it a full
+    signal that should go through the normal parser, not the instant-entry path.
+    """
+    m = _INSTANT_RE.search(text)
+    if not m:
+        return None
+    # If the message carries SL or TP values it is a full signal, not instant
+    if re.search(r'\bSL[\s:]+[\d.,]+', text, re.IGNORECASE):
+        return None
+    if re.search(r'\bTP\s*\d', text, re.IGNORECASE):
+        return None
+    price_str = m.group(2)
+    price = _f(price_str) if price_str else None
+    return (m.group(1).upper(), price)
+
+
+def parse_gd2_instant_entry(text: str) -> Optional[tuple]:
+    """
+    Detect a GD2 instant-entry (bare direction, nothing else yet) message:
+    'XAU USD BUY [NOW]' / 'XAU USD SELL [NOW]', or the newer "Buy/Sell Zone
+    Now" trigger (see _GD2_ZONE_DIRECTION_RE) — GD2 changed formats
+    2026-07-06 and this was missed in that pass, silently disabling
+    Immediate Market Entry for the new format's bare trigger even though the
+    setting was still on and correctly synced between nodes.
+    Matches with or without 'NOW'.  Always returns a market order (price=None).
+
+    Returns None if the message already contains SL or TP data (in either
+    format's own syntax) — that is a full signal and should go through
+    parse_gd2_signal instead.
+    """
+    m = _GD2_DIRECTION_RE.search(text)
+    is_zone = False
+    if not m:
+        m = _GD2_ZONE_DIRECTION_RE.search(text)
+        is_zone = True
+    if not m:
+        return None
+
+    if is_zone:
+        if _GD2_SL_ZONE_RE.search(text):
+            return None
+        if _GD2_TARGETS_HEADER_RE.search(text, m.end()):
+            return None
+    else:
+        if re.search(r'\bSL[\s:]+[\d.,]+', text, re.IGNORECASE):
+            return None
+        if re.search(r'\bTP\s*\d', text, re.IGNORECASE):
+            return None
+
+    # If a price range follows the direction keyword, this is a partial signal
+    # (direction + entry range, SL/TP to follow via edit).  Let parse_gd2_partial
+    # handle it so the range is captured and the signal awaits the followup edit.
+    if _GD2_ENTRY_RANGE_RE.search(text, m.end()):
+        return None
+    return (m.group(1).upper(), None)
+
+
+def parse_gold_signal(text: str) -> Optional[dict]:
+    """
+    Parse a Format A/B (Gold Diggers VIP) XAUUSD signal message.
+    Returns a dict of signal fields or None if not a valid signal.
+    """
+    currency_m = _CURRENCY_RE.search(text)
+    if currency_m and currency_m.group(1).upper().replace("/", "").replace("-", "") != "XAUUSD":
+        return None
+
+    clean = re.sub(r'\*+([^*\n]+)\*+', r'\1', text)
+
+    direction = entry_low = entry_high = stop_loss = None
+
+    m = _DIRECTION_RE.search(clean)
+    if m:
+        direction  = m.group(1).upper()
+        price_a    = _f(m.group(2))
+        price_b    = _f(m.group(3))
+        entry_low  = min(price_a, price_b)
+        entry_high = max(price_a, price_b)
+
+    if direction is None:
+        mb = _DIRECTION_B_RE.search(clean)
+        eb = _ENTRY_B_RE.search(clean)
+        if mb and eb:
+            direction  = mb.group(1).upper()
+            price_a    = _f(eb.group(1))
+            price_b    = _f(eb.group(2))
+            entry_low  = min(price_a, price_b)
+            entry_high = max(price_a, price_b)
+
+    if direction is None:
+        return None
+
+    sl_m = _SL_RE.search(clean) or _SL_B_RE.search(clean)
+    if not sl_m:
+        return None
+    stop_loss = _f(sl_m.group(1))
+
+    tps: dict[int, float] = {}
+    for tm in _TP_RE.finditer(clean):
+        n = int(tm.group(1))
+        if n <= 9:
+            tps.setdefault(n, _f(tm.group(2)))
+    for tm in _TP_B_RE.finditer(clean):
+        n = int(tm.group(1))
+        if n <= 9:
+            tps[n] = _f(tm.group(2))
+
+    om = _TPOPEN_RE.search(clean)
+    if om:
+        open_tp_num = int(om.group(1))
+        values = [_f(v) for v in re.split(r'[/\s]+', om.group(2).strip()) if v.strip()]
+        for i, v in enumerate(values[:2]):
+            slot = open_tp_num + i
+            if slot <= 5:
+                tps.setdefault(slot, v)
+
+    raw = {
+        "direction":  direction,
+        "entry_low":  entry_low,
+        "entry_high": entry_high,
+        "stop_loss":  stop_loss,
+        "tp1": tps.get(1),
+        "tp2": tps.get(2),
+        "tp3": tps.get(3),
+        "tp4": tps.get(4),
+        "tp5": tps.get(5),
+        "tp6": tps.get(6),
+        "tp7": tps.get(7),
+        "tp8": tps.get(8),
+    }
+    return _autocorrect_tps(direction, entry_low, entry_high, raw)
+
+
+def parse_gd2_signal(text: str) -> Optional[dict]:
+    """
+    Parse a Format C (Gold Diggers 2.0) XAUUSD signal.
+    Three layout variants, tried in order:
+
+    C1 — "XAU USD BUY/SELL NOW" (older):
+         entry range is dash-separated; TPs use "TP1: <price>" labels.
+    C2 — "Buy/Sell Zone Now" / "Buy/Sell Gold Now" (added 2026-07-06):
+         entry range is dash-separated below the direction line;
+         TPs are bare numbers under a "Targets" header;
+         SL uses "SL/ invalid <price>".
+    C3 — "BUY [LIMITS] GOLD @ xxxx/yyyy AREA" (observed 2026-07-09):
+         entry range is slash-separated after "@";
+         TPs use bare "TP <price>" lines (no ordinal, "TP OPEN" ignored);
+         SL uses bare "SL <price>".
+    """
+    # ── C1: XAU USD BUY/SELL [NOW] ──────────────────────────────────────────
+    dm = _GD2_DIRECTION_RE.search(text)
+    is_zone = False
+    is_limits = False
+    if not dm:
+        # ── C2: Buy/Sell Zone/Gold Now ───────────────────────────────────────
+        dm = _GD2_ZONE_DIRECTION_RE.search(text)
+        if dm:
+            is_zone = True
+    if not dm:
+        # ── C3: BUY [LIMITS] GOLD @ xxxx/yyyy ───────────────────────────────
+        dm = _GD2_LIMITS_DIRECTION_RE.search(text)
+        if dm:
+            is_limits = True
+    if not dm:
+        return None
+    direction = dm.group(1).upper()
+
+    if is_limits:
+        # Entry range is "@ high/low AREA" (slash-separated)
+        arm = _GD2_AT_RANGE_RE.search(text)
+        if not arm:
+            return None
+        price_a   = _f(arm.group(1))
+        price_b   = _f(arm.group(2))
+        entry_low  = min(price_a, price_b)
+        entry_high = max(price_a, price_b)
+    else:
+        em = _GD2_ENTRY_RANGE_RE.search(text, dm.end())
+        if em:
+            price_a    = _f(em.group(1))
+            price_b    = _f(em.group(2))
+            entry_low  = min(price_a, price_b)
+            entry_high = max(price_a, price_b)
+        else:
+            sm = _GD2_ENTRY_SINGLE_RE.search(text, dm.end())
+            if not sm:
+                return None
+            price      = _f(sm.group(1))
+            entry_low  = entry_high = price
+
+    if is_zone:
+        # No "Targets" header: Gold Diggers Scalping's "Gold Now" posts list
+        # plain "TP <price>" lines instead, and without this they never
+        # parsed in full (docs/todo/bugs/061, 2026-10-11).
+        tps = _parse_gd2_zone_targets(text, dm.end()) or _parse_gd2_plain_tps(text)
+    elif is_limits:
+        # C3: bare "TP <price>" lines; "TP OPEN" skipped by regex
+        tps = _parse_gd2_plain_tps(text)
+    else:
+        tps = {}
+        for tm in _GD2_TP_RE.finditer(text):
+            n = int(tm.group(1))
+            if 1 <= n <= 8:
+                tps[n] = _f(tm.group(2))
+    if 1 not in tps:
+        return None
+
+    slm = (_GD2_SL_ZONE_RE if is_zone else _GD2_SL_RE).search(text)
+    if not slm:
+        return None
+    stop_loss = _f(slm.group(1))
+
+    raw = {
+        "direction":  direction,
+        "entry_low":  entry_low,
+        "entry_high": entry_high,
+        "stop_loss":  stop_loss,
+        "tp1": tps.get(1),
+        "tp2": tps.get(2),
+        "tp3": tps.get(3),
+        "tp4": tps.get(4),
+        "tp5": tps.get(5),
+        "tp6": tps.get(6),
+        "tp7": tps.get(7),
+        "tp8": tps.get(8),
+    }
+    return _autocorrect_tps(direction, entry_low, entry_high, raw)
+
+
+def parse_gd2_partial(text: str) -> Optional[dict]:
+    """
+    Detect a GD2 message that has direction + entry range but is missing SL and/or TP.
+    GD2 sometimes sends "XAU USD SELL NOW\n4150.5 - 4155.5" first, then edits to add
+    SL/TP later.  This parser records those early messages so the edit can complete them.
+    Covers all three GD2 variants (C1/C2/C3 — see parse_gd2_signal for layout details).
+
+    Returns {"direction", "entry_low", "entry_high"} or None.
+    Returns None if the message already has both SL and TP (use parse_gd2_signal instead).
+    """
+    dm = _GD2_DIRECTION_RE.search(text)
+    is_zone = False
+    is_limits = False
+    if not dm:
+        dm = _GD2_ZONE_DIRECTION_RE.search(text)
+        if dm:
+            is_zone = True
+    if not dm:
+        dm = _GD2_LIMITS_DIRECTION_RE.search(text)
+        if dm:
+            is_limits = True
+    if not dm:
+        return None
+    direction = dm.group(1).upper()
+
+    if is_limits:
+        arm = _GD2_AT_RANGE_RE.search(text)
+        if not arm:
+            return None
+        price_a    = _f(arm.group(1))
+        price_b    = _f(arm.group(2))
+        entry_low  = min(price_a, price_b)
+        entry_high = max(price_a, price_b)
+    else:
+        em = _GD2_ENTRY_RANGE_RE.search(text, dm.end())
+        if em:
+            price_a    = _f(em.group(1))
+            price_b    = _f(em.group(2))
+            entry_low  = min(price_a, price_b)
+            entry_high = max(price_a, price_b)
+        else:
+            sm = _GD2_ENTRY_SINGLE_RE.search(text, dm.end())
+            if not sm:
+                return None
+            price      = _f(sm.group(1))
+            entry_low  = entry_high = price
+
+    # If both SL and at least one TP are present, this is a full signal —
+    # let parse_gd2_signal handle it.
+    if is_zone:
+        if _GD2_SL_ZONE_RE.search(text) and _parse_gd2_zone_targets(text, dm.end()):
+            return None
+    elif is_limits:
+        if _GD2_SL_RE.search(text) and _parse_gd2_plain_tps(text):
+            return None
+    else:
+        if _GD2_SL_RE.search(text) and _GD2_TP_RE.search(text):
+            return None
+
+    return {"direction": direction, "entry_low": entry_low, "entry_high": entry_high}
+
+
+def is_gd2_message(text: str) -> bool:
+    """True if this message plausibly came from Gold Diggers 2.0, in any of
+    the three known layout variants:
+      C1 — "XAU USD BUY/SELL NOW"
+      C2 — "Buy/Sell Zone Now" / "Buy/Sell Gold Now"
+      C3 — "BUY [LIMITS] GOLD @ xxxx/yyyy AREA" (added 2026-07-09)
+    Callers used to gate GD2 handling on a bare `"XAU" in text` check, which
+    silently dropped every message in the C2/C3 formats — none of their text
+    mentions XAU anywhere. Use this instead."""
+    return (
+        _GD2_DIRECTION_RE.search(text) is not None or
+        _GD2_ZONE_DIRECTION_RE.search(text) is not None or
+        _GD2_LIMITS_DIRECTION_RE.search(text) is not None
+    )
+
+
+def is_limit_order_signal(text: str) -> bool:
+    """True for the "BUY/SELL [LIMITS] GOLD @ x/y AREA" pending-order layout
+    (GD2 Format C3) — checked independently of any channel's configured
+    parser_format/is_gd2_message gate, so a genuine broker-side pending
+    order can be placed for this exact shape no matter which channel it
+    arrives from (any channel, format-matched only)."""
+    return _GD2_LIMITS_DIRECTION_RE.search(text) is not None
+
+
+def parse_limit_order_signal(text: str) -> Optional[dict]:
+    """Parse the C3 pending-order layout into a signal dict — same shape as
+    parse_gd2_signal() (direction/entry_low/entry_high/stop_loss/tp1..tp8)
+    plus a `tp_open` flag: True if the message contains a literal "TP OPEN"
+    line, meaning the portion left after the last numeric TP has no fixed
+    target and rides as a runner (see core_limit_order_signal.py). Delegates
+    the actual field extraction to parse_gd2_signal — this function only
+    adds the format gate + the tp_open flag, so C3's parsing logic has a
+    single source of truth."""
+    if not is_limit_order_signal(text):
+        return None
+    parsed = parse_gd2_signal(text)
+    if not parsed:
+        return None
+    parsed = dict(parsed)
+    parsed["tp_open"] = bool(_GD2_TP_OPEN_RE.search(text))
+    return parsed
+
+
+def parse_format_ab_partial(text: str) -> Optional[dict]:
+    """Format A/B counterpart to parse_gd2_partial: direction + entry range
+    with no Stop Loss and no TP yet. parse_gold_signal returns None outright
+    when _SL_RE/_SL_B_RE don't match, so without this a Format A/B channel
+    that splits its entry and its levels across two messages produces no
+    signal dict at all -- there was nothing for a follow-up to complete.
+
+    Returns {"direction", "entry_low", "entry_high"} or None. Returns None
+    when SL or any TP is already present (that's a full signal -- use
+    parse_gold_signal) and for a non-XAUUSD Currency line, matching
+    parse_gold_signal's own gate so this can't smuggle in a pair the app
+    doesn't trade."""
+    currency_m = _CURRENCY_RE.search(text)
+    if currency_m and currency_m.group(1).upper().replace("/", "").replace("-", "") != "XAUUSD":
+        return None
+
+    clean = re.sub(r'\*+([^*\n]+)\*+', r'\1', text)
+
+    direction = entry_low = entry_high = None
+    m = _DIRECTION_RE.search(clean)
+    if m:
+        direction = m.group(1).upper()
+        price_a, price_b = _f(m.group(2)), _f(m.group(3))
+        entry_low, entry_high = min(price_a, price_b), max(price_a, price_b)
+    else:
+        mb, eb = _DIRECTION_B_RE.search(clean), _ENTRY_B_RE.search(clean)
+        if mb and eb:
+            direction = mb.group(1).upper()
+            price_a, price_b = _f(eb.group(1)), _f(eb.group(2))
+            entry_low, entry_high = min(price_a, price_b), max(price_a, price_b)
+
+    if direction is None:
+        return None
+    if _SL_RE.search(clean) or _SL_B_RE.search(clean):
+        return None
+    if _TP_RE.search(clean) or _TP_B_RE.search(clean):
+        return None
+    return {"direction": direction, "entry_low": entry_low, "entry_high": entry_high}
+
+
+def _extract_levels(text: str) -> dict:
+    """Every SL/TP this message states, in any supported format's syntax.
+    Values absent from the text come back as None."""
+    clean = re.sub(r'\*+([^*\n]+)\*+', r'\1', text)
+
+    sl_m = _SL_RE.search(clean) or _SL_B_RE.search(clean) or _GD2_SL_RE.search(clean)
+    tps: dict[int, float] = {}
+    for pattern in (_TP_RE, _TP_B_RE, _GD2_TP_RE):
+        for tm in pattern.finditer(clean):
+            n = int(tm.group(1))
+            if n <= 8:
+                tps.setdefault(n, _f(tm.group(2)))
+
+    return {
+        "stop_loss": _f(sl_m.group(1)) if sl_m else None,
+        **{f"tp{i}": tps.get(i) for i in range(1, 9)},
+    }
+
+
+def parse_partial_any_format(text: str) -> Optional[dict]:
+    """Format-agnostic "direction + entry, levels still to come" detector for
+    TP/SL in Second Message. Tries GD2's existing partial parser first (it
+    covers all three GD2 layouts), then Format A/B's.
+
+    Carries through any SL/TP the message *did* state: parse_gd2_partial
+    treats a message as partial when either SL or TP is missing, so a GD2
+    entry that quotes its Stop Loss but no targets yet reaches here with a
+    real SL that must not be thrown away -- holding it and later executing
+    bare would otherwise place the trade with no stop at all.
+
+    Returns {"direction", "entry_low", "entry_high", "stop_loss",
+    "tp1".."tp8"} or None."""
+    partial = parse_gd2_partial(text) or parse_format_ab_partial(text)
+    if not partial:
+        return None
+    result = {**partial, **_extract_levels(text)}
+    # `tp_open` is what routes a signal to Limit Runner's resting pending
+    # order rather than market execution, so a held C3 "[LIMITS] GOLD @"
+    # entry has to carry it through the merge or it would come back out as
+    # an ordinary market signal.
+    if is_limit_order_signal(text):
+        result["tp_open"] = bool(_GD2_TP_OPEN_RE.search(text))
+    return result
+
+
+def parse_tp_sl_only(text: str) -> Optional[dict]:
+    """The other half of TP/SL in Second Message: a follow-up message that
+    carries Stop Loss and/or TP levels but names no direction and no entry
+    of its own, so it can only be read as completing an earlier signal.
+
+    Returns {"stop_loss", "tp1".."tp8"} (any of which may be None) or None
+    if the message states a direction, or carries neither SL nor any TP.
+    Refusing anything with a direction is what keeps this from swallowing a
+    complete standalone signal -- that must go through the normal parsers."""
+    if (_DIRECTION_RE.search(text) or _DIRECTION_B_RE.search(text)
+            or _GD2_DIRECTION_RE.search(text) or _GD2_ZONE_DIRECTION_RE.search(text)
+            or _GD2_LIMITS_DIRECTION_RE.search(text)):
+        return None
+
+    levels = _extract_levels(text)
+    if levels["stop_loss"] is None and all(levels[f"tp{i}"] is None for i in range(1, 9)):
+        return None
+    if _GD2_TP_OPEN_RE.search(text):
+        levels["tp_open"] = True
+    return levels
+
+
+def validate_signal(direction: str, entry_low: float, entry_high: float,
+                    stop_loss: float, *tp_args) -> list[str]:
+    """
+    Returns list of validation error strings. Empty = valid.
+    Accepts up to 8 TP values as positional args (tp1 … tp8); extras beyond 8 are ignored.
+
+    A None stop_loss is reported as an error, not raised on: this is a
+    validator, and every caller already handles the returned list by
+    skipping the signal with a readable reason. It used to compare None
+    against a float and raise TypeError straight out of the caller's own
+    scan loop instead (2026-08-05).
+    """
+    errors    = []
+    direction = direction.upper()
+    if entry_low > entry_high:
+        errors.append("entry_low must be <= entry_high")
+
+    # Normalise TP args — positional, up to 8
+    tp_list = list(tp_args[:8])  # tp1..tp8
+
+    if stop_loss is None:
+        errors.append("Stop Loss is required")
+
+    if direction == "BUY":
+        if stop_loss is not None and stop_loss >= entry_low:
+            errors.append("Stop Loss must be below entry range for BUY")
+        for i, tp in enumerate(tp_list, 1):
+            if tp is not None and tp <= entry_high:
+                errors.append(f"TP{i} must be above entry range for BUY")
+    elif direction == "SELL":
+        if stop_loss is not None and stop_loss <= entry_high:
+            errors.append("Stop Loss must be above entry range for SELL")
+        for i, tp in enumerate(tp_list, 1):
+            if tp is not None and tp >= entry_low:
+                errors.append(f"TP{i} must be below entry range for SELL")
+    else:
+        errors.append("Direction must be BUY or SELL")
+
+    active_tps = [t for t in tp_list if t is not None]
+    for i in range(len(active_tps) - 1):
+        if direction == "BUY" and active_tps[i] >= active_tps[i + 1]:
+            errors.append(f"TP{i+1} must be less than TP{i+2} for BUY")
+        elif direction == "SELL" and active_tps[i] <= active_tps[i + 1]:
+            errors.append(f"TP{i+1} must be greater than TP{i+2} for SELL")
+
+    return errors
+
+
+# ── AI-derived learned rules ───────────────────────────────────────────────────
+# Rules approved via Telegram > Reader Logic > AI. The automatic rule-writer
+# that was meant to fill these in (ai_rule_generator.py, later
+# channels/rule_generator.py) was deleted on 2026-08-26 -- it had never been
+# called in either repo. See Q002 #1 in docs/simon-handover/002-unwired-modules.md;
+# recoverable from git history if automatic rule learning is ever wanted.
+# a JSON dict of regex patterns auto-generated from one confirmed AI
+# extraction and self-validated before ever being saved. apply_learned_rule()
+# is the single place both the generator's own validation step and live
+# message parsing use to actually run a rule, so there is exactly one
+# implementation of "how a rule turns into extracted values" to keep correct.
+

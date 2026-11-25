@@ -1,0 +1,15 @@
+{
+  "_comment": [
+    "Extracted functions that nothing calls. Every entry here is dead code that",
+    "we have decided not to remove YET -- an allowlist entry is a debt record,",
+    "not an approval.",
+    "",
+    "The five order-path entries are gone as of 2026-07-27: they were deleted",
+    "rather than wired, because each built a partial CloseTradeContext and the",
+    "live inline copies in engine.py are the correct ones. They get re-extracted",
+    "against the real context in phases 6 and 8.",
+    "",
+    "What remains are three trivial in-module defaults, permanently allowed."
+  ],
+  "allowed": []
+}

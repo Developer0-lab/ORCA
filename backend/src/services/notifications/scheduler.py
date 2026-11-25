@@ -1,0 +1,256 @@
+"""Email scheduler sweep -- extracted verbatim (no logic changes) from
+core/engine.py's SimulationEngine._email_scheduler_loop's per-cycle body,
+as part of the core/engine.py migration series. See
+docs/todo/refactor/core-email-scheduler-migration/020-*.md.
+
+No MT5 order is placed/modified/closed directly by this module, but the
+ORB section's auto-execute path can trigger one via the already-extracted
+core_orb_report.orb_auto_execute (its own order-placing behavior was
+already characterized in core-orb-report-migration).
+
+Reuses core_orb_report.build_orb_report/orb_auto_execute and
+core_mt5_performance.compute_mt5_performance as collaborators (all three
+already extracted and independently characterized) rather than re-deriving
+them. `is_active_trader_node`/`cfg_obj` (the engine's own `self._cfg`,
+forwarded to the selected AI provider for the daily analysis) are taken as explicit
+parameters, same pattern as every other pack in this cluster.
+
+Note: the ORB section's time gate uses Europe/London
+(`datetime.now(ZoneInfo("Europe/London"))`), while the daily/weekly send-
+time gate uses bare server-local `datetime.now()` -- a pre-existing
+inconsistency, preserved here as `uk_now`/`local_now`, each independently
+injectable for tests.
+"""
+from __future__ import annotations
+
+import asyncio
+
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Any, Optional
+from zoneinfo import ZoneInfo
+
+from backend.src.db import database as db_module
+from backend.src.services.notifications import repo as notifications_repo
+from backend.src.services.ai import claude_ai as claude_ai
+from backend.src.services.notifications import email_service
+from backend.src.services.broker.mt5_performance import compute_mt5_performance
+from backend.src.services.analytics import orb_ny
+from backend.src.services.analytics.orb_report import build_orb_report
+from backend.src.services.trading.orb_execute import orb_auto_execute
+
+log = logging.getLogger(__name__)
+
+
+_ORB_AUTO_EXEC_END_HOUR = 21  # stop watching for a fresh breakout after this Europe/London hour
+
+
+async def _run_orb_section(bridge: Any, cfg: dict, is_active_trader_node: bool,
+                            uk_now: datetime) -> None:
+    """
+    Email: still sent once, at exactly 08:15 Europe/London (the moment the
+    opening range closes) -- a snapshot of the range/setup, unchanged
+    timing from before this report's methodology rebuild.
+
+    Auto-execute: 2026-08-01 -- widened from a single exact-minute check at
+    08:15 to a per-minute watch from 08:15 through
+    _ORB_AUTO_EXEC_END_HOUR. The rebuilt report only confirms a breakout
+    once price clears BOTH the London opening range and the Asian range,
+    which can happen anywhere from the moment the range closes to hours
+    later, not reliably in the single tick that happens to land on 08:15 --
+    checking only that one minute would have meant this almost never
+    fired. Still at most one trade/day: `orb_auto_execute_last` is set the
+    first time a confirmed breakout is acted on, and gates every
+    subsequent minute the same day.
+    """
+    orb_email_on = bool(cfg.get("orb_report_enabled", 1))
+    orb_auto_rs = await db_module.to_db_thread(db_module.get_risk_settings)
+    orb_auto_on = bool(orb_auto_rs.get("orb_auto_execute_enabled", 0))
+    if not (orb_email_on or orb_auto_on):
+        return
+    if uk_now.weekday() >= 5:
+        return
+    try:
+        uk_date_str = uk_now.strftime("%Y-%m-%d")
+        report = None
+
+        if orb_email_on and uk_now.hour == 8 and uk_now.minute == 15:
+            if db_module.get_app_config("email_last_orb") != uk_date_str:
+                report = await build_orb_report(bridge)
+                if report:
+                    # ~1.8 s of matplotlib (2026-09-23 08:15) -- off the loop.
+                    chart_png = await asyncio.to_thread(
+                        email_service.build_orb_chart_image, report)
+                    orb_html = email_service.build_orb_html(
+                        report, uk_now.strftime("%A, %d %B %Y"),
+                        has_chart=bool(chart_png),
+                    )
+                    ok, err = await email_service.send_email(
+                        f"FOREX Trader — London Open ORB Report — {uk_date_str}",
+                        orb_html, cfg,
+                        image_bytes=chart_png, image_cid=email_service._ORB_CHART_CID,
+                    )
+                    if ok:
+                        db_module.set_app_config("email_last_orb", uk_date_str)
+                    log.info("ORB report email %s%s", "sent" if ok else "FAILED",
+                              f": {err}" if err else "")
+
+        _in_auto_window = (
+            (uk_now.hour == 8 and uk_now.minute >= 15)
+            or (8 < uk_now.hour < _ORB_AUTO_EXEC_END_HOUR)
+        )
+        if orb_auto_on and _in_auto_window and not _orb_ny_mode() \
+                and db_module.get_app_config("orb_auto_execute_last") != uk_date_str:
+            if report is None:
+                report = await build_orb_report(bridge)
+            if report and report.get("direction") in ("bullish", "bearish"):
+                await orb_auto_execute(report, bridge, is_active_trader_node)
+                db_module.set_app_config("orb_auto_execute_last", uk_date_str)
+    except Exception as e:
+        log.warning("ORB report scheduling error: %s", e)
+
+
+def _orb_ny_mode() -> bool:
+    """Expert Tunable `orb_ny_mode`: the New York ORB replaces the London
+    report's auto-execute. Read per call, never at import."""
+    from backend.src.services.risk import expert_params
+    return bool(expert_params.get("orb_ny_mode"))
+
+
+async def _run_orb_ny_auto(bridge: Any, is_active_trader_node: bool) -> None:
+    """The New York ORB's auto-execute, once a minute (2026-10-01).
+
+    Outside the email section on purpose: that section returns early on a
+    node with no email provider, so the London auto-execute never traded
+    there at all. At most one decision a New York day: a signal is handed to
+    `orb_auto_execute` and a "done" report (skipped, missed, no breakout)
+    ends the day; either sets `orb_auto_execute_last`, the key the London
+    path uses, so switching modes mid-day cannot trade twice.
+    """
+    rs = await db_module.to_db_thread(db_module.get_risk_settings)
+    if not rs.get("orb_auto_execute_enabled"):
+        return
+    now_ts = time.time()
+    now_utc = datetime.fromtimestamp(now_ts, timezone.utc)
+    day = now_utc.astimezone(orb_ny.NY).strftime("%Y-%m-%d")
+    if db_module.get_app_config("orb_auto_execute_last") == day:
+        return
+    opened = orb_ny.open_utc(now_utc)
+    start = opened + orb_ny.OR_MINUTES * 60
+    end = start + orb_ny.ENTRY_WINDOW_MINUTES * 60 + orb_ny.FRESH_S
+    if not (start <= now_ts <= end):
+        return
+    try:
+        report = await orb_ny.build_report(bridge, now_ts)
+        if not report:
+            return
+        if report.get("phase") == "signal":
+            await orb_auto_execute(report, bridge, is_active_trader_node)
+            db_module.set_app_config("orb_auto_execute_last", day)
+        elif report.get("phase") == "done":
+            log.info("[ORB NY] no trade today: %s", report.get("position_note"))
+            db_module.set_app_config("orb_auto_execute_last", day)
+    except Exception as e:
+        log.warning("ORB NY auto-execute error: %s", e)
+
+
+async def _run_daily_section(bridge: Any, cfg: dict, cfg_obj: Any,
+                              is_active_trader_node: bool, local_now: datetime,
+                              today_str: str, perf: dict) -> None:
+    if not (cfg.get("daily_enabled") and local_now.weekday() < 5 and is_active_trader_node):
+        return
+    last_daily = db_module.get_app_config("email_last_daily")
+    if last_daily == today_str:
+        return
+    day_cutoff = local_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    closed_today = notifications_repo.fetch_closed_trades_since(day_cutoff)
+    _balance = float(perf.get("balance", 0) or 0)
+    _dpnl = float(perf.get("daily_pnl", 0) or 0)
+    try:
+        ai_analysis = await claude_ai.generate_daily_analysis(
+            closed_today, _balance, _dpnl, cfg_obj,
+        )
+    except Exception as _ae:
+        log.warning("Daily AI analysis failed: %s", _ae)
+        ai_analysis = None
+    html = email_service.build_daily_html(
+        perf, closed_today,
+        local_now.strftime("%A, %d %B %Y"),
+        claude_analysis=ai_analysis,
+    )
+    ok, err = await email_service.send_email(
+        f"FOREX Trader Daily Summary — {today_str}", html, cfg
+    )
+    if ok:
+        db_module.set_app_config("email_last_daily", today_str)
+    log.info("Daily email %s%s", "sent" if ok else "FAILED",
+              f": {err}" if err else "")
+
+
+async def _run_weekly_section(cfg: dict, is_active_trader_node: bool,
+                               local_now: datetime, perf: dict) -> None:
+    if not (cfg.get("weekly_enabled") and local_now.weekday() == 4 and is_active_trader_node):
+        return
+    iso = local_now.isocalendar()
+    week_key = f"{iso[0]}-W{iso[1]:02d}"
+    last_weekly = db_module.get_app_config("email_last_weekly")
+    if last_weekly == week_key:
+        return
+    cutoff_week = time.time() - 7 * 86400
+    week_trades = notifications_repo.fetch_closed_trades_since(cutoff_week)
+    html = email_service.build_weekly_html(
+        perf, week_trades,
+        f"Week ending {local_now.strftime('%d %B %Y')}",
+    )
+    ok, err = await email_service.send_email(
+        f"FOREX Trader Weekly Summary — {week_key}", html, cfg
+    )
+    if ok:
+        db_module.set_app_config("email_last_weekly", week_key)
+    log.info("Weekly email %s%s", "sent" if ok else "FAILED",
+              f": {err}" if err else "")
+
+
+async def email_scheduler_sweep(bridge: Any, cfg_obj: Any, is_active_trader_node: bool,
+                                 uk_now: Optional[datetime] = None,
+                                 local_now: Optional[datetime] = None) -> None:
+    if _orb_ny_mode():
+        await _run_orb_ny_auto(bridge, is_active_trader_node)
+
+    cfg = db_module.get_email_config()
+    # Any one of these makes send_email() able to deliver — checking
+    # smtp_host alone here (as before) silently skipped this entire
+    # loop, ORB report included, on a node configured for Resend/
+    # Mailjet with no SMTP host set at all (confirmed live on the
+    # VPS: resend_api_key present, smtp_host empty).
+    has_provider = bool(
+        (cfg.get("smtp_host") or "").strip()
+        or (cfg.get("resend_api_key") or "").strip()
+        or (cfg.get("mailjet_api_key") or "").strip()
+    )
+    if not has_provider:
+        return
+
+    if uk_now is None:
+        uk_now = datetime.now(ZoneInfo("Europe/London"))
+    await _run_orb_section(bridge, cfg, is_active_trader_node, uk_now)
+
+    if local_now is None:
+        local_now = datetime.now()
+    send_time_str = cfg.get("send_time", "18:00") or "18:00"
+    try:
+        sh, sm = [int(x) for x in send_time_str.split(":")]
+    except Exception:
+        sh, sm = 18, 0
+    if local_now.hour != sh or local_now.minute != sm:
+        return
+
+    today_str = local_now.strftime("%Y-%m-%d")
+    try:
+        perf = await compute_mt5_performance(bridge, 90)
+    except Exception:
+        perf = {}
+
+    await _run_daily_section(bridge, cfg, cfg_obj, is_active_trader_node, local_now, today_str, perf)
+    await _run_weekly_section(cfg, is_active_trader_node, local_now, perf)

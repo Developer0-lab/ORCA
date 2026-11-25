@@ -1,0 +1,118 @@
+{
+  "_comment": [
+    "Whole modules that nothing imports, transitively, from the app entrypoints.",
+    "An entry is a recorded debt, NOT an approval to keep the code. The gate",
+    "(orphan_modules --check) fails on any orphan NOT listed, and on any listed",
+    "module that is no longer an orphan (delete its entry when you delete/wire it).",
+    "",
+    "The 3 superseded-dead database.py clones were DELETED 2026-08-10. The 3 below are built-but-UNWIRED (not dead): deleting them would destroy real functionality and hide a wiring bug. Each needs an OWNER (Simon) wire-vs-remove decision -- see docs/questions/002-unwired-modules.md. Do NOT delete until then.",
+    "2026-09-18 (final): the eight remaining tabs, the rest of the Trading tab, the node/update panel and the licence screens all landed. Every 'awaiting-react-port' entry is gone. notifications_controller was the last of them and outlived the port because the Settings tab shipped without the test-send buttons that used it; wiring those (routers/notifications.py) cleared it. The three entries left are the pre-React debts this file was opened for."
+  ],
+  "allowed": [
+    {
+      "module": "backend.src.services.backtest.entry_trials",
+      "file": "backend/src/services/backtest/entry_trials.py",
+      "loc": 224,
+      "class": "unwired-tool",
+      "reason": "Owner-approved offline signal-entry experiments, invoked by tools/signal_entry_research.py only. Intentionally outside the app and order paths; protocol and input schema live in docs/system/domains/engines/entry-research.md. Covered by tests/backtest/test_entry_trials.py and test_entry_research_cli.py. Remove this entry if wired or removed."
+    },
+    {
+      "module": "backend.src.services.broker.fake_bridge",
+      "file": "backend/src/services/broker/fake_bridge.py",
+      "loc": 316,
+      "class": "awaiting-simon-gated-seam",
+      "reason": "Debug-mode FakeMT5Bridge (stage2 phase5/010). Fully built and test-covered (tests/services/broker/); production wiring is the 3-line _make_bridge seam in runtime.py, which is Simon-gated (sign-off + demo, local-debug-mode 020). Remove this entry the day the seam lands."
+    },
+    {
+      "module": "backend.src.services.broker.fake_market",
+      "file": "backend/src/services/broker/fake_market.py",
+      "loc": 124,
+      "class": "awaiting-simon-gated-seam",
+      "reason": "FakeMT5Bridge's deterministic tick engine -- imported only by fake_bridge.py, so it orphans together with it. Same seam, same removal condition."
+    },
+    {
+      "module": "backend.src.services.breakout_signal.backtest",
+      "file": "backend/src/services/breakout_signal/backtest.py",
+      "loc": 226,
+      "class": "unwired-tool",
+      "reason": "Walk-forward harness to validate breakout recalibrations BEFORE they touch live trading; its docstring documents manual invocation (run_walkforward/report). Likely a dev tool, not dead. The frontend backtest page uses a different system (services.backtest)."
+    },
+    {
+      "module": "backend.src.services.backtest.resample",
+      "file": "backend/src/services/backtest/resample.py",
+      "loc": 239,
+      "class": "unwired-tool",
+      "reason": "Monte Carlo band around the backtest's single equity path -- docs/todo/backtest/020. Pure: takes a StrategyStats, returns percentiles, reaches nothing. Unwired because whether it surfaces on the Backtest page or stays a tool is the open decision in that file's section 3, and the owner has not answered it. Pinned by tests/backtest/test_resample.py. Delete this entry when the decision is made and it is wired (or removed)."
+    },
+    {
+      "module": "backend.src.services.backtest.event_buckets",
+      "file": "backend/src/services/backtest/event_buckets.py",
+      "loc": 153,
+      "class": "unwired-tool",
+      "reason": "Buckets closed signals by signed minutes to NFP / FOMC (rules) plus any events passed in a CSV. Pure; the database read is in tools/event_buckets.py, which is its caller and is not an app entrypoint. Research only: it exists to decide whether a post-release blackout or an event-radar feature is worth building, and the first run (4 events) could not say. Pinned by tests/backtest/test_event_buckets.py. Delete this entry if it is wired or removed."
+    },
+    {
+      "module": "backend.src.services.analytics.regime_drift",
+      "file": "backend/src/services/analytics/regime_drift.py",
+      "loc": 194,
+      "class": "unwired-tool",
+      "reason": "Phase 1 of docs/todo/004: recomputes utils/regime.py's per-hour and per-level buckets over a live window and reports where the frozen constants and the data now disagree. Pure; the DB read is in tools/regime_drift_report.py, which is its caller and is not an app entrypoint. Unwired on purpose -- acting on what it reports is phase 2 and waits on the owner's answer to 004 section 4A, because a gate that widens can open trading hours that are shut today. Pinned by tests/analytics/test_regime_drift.py."
+    },
+    {
+      "module": "backend.src.services.reversal_engine.own_template_label",
+      "file": "backend/src/services/reversal_engine/own_template_label.py",
+      "loc": 96,
+      "class": "unwired-tool",
+      "reason": "docs/todo/reversal-engine/250 step 2: replays a Reversal signal through the EA template it traded under (backtest/template_simulator) or refuses with a reason. Pure; its caller is tools/re_measurement_audit.py, which is not an app entrypoint. Unwired on purpose -- feeding it to tpl_label_sweep would change what edge_model learns and so what the demo gate passes, which waits on the owner (docs/simon-handover/046). Pinned by tests/reversal_engine/test_own_template_label.py."
+    },
+    {
+      "module": "backend.src.services.backtest.edge_trials",
+      "file": "backend/src/services/backtest/edge_trials.py",
+      "loc": 280,
+      "class": "unwired-tool",
+      "reason": "The 2025 edge trials (docs/todo/reversal-engine/270). Pure: bars in, trades and verdicts out. Imported only by tools/edge_trials_2025.py and tools/edge_holdout.py, which are research scripts and not app entrypoints. Pinned by tests/backtest/test_edge_trials.py. Delete this entry if it is wired or removed."
+    },
+    {
+      "module": "backend.src.services.backtest.drift_trials",
+      "file": "backend/src/services/backtest/drift_trials.py",
+      "loc": 205,
+      "class": "unwired-tool",
+      "reason": "The session-drift trials (docs/todo/018): Asian-hours, Friday and 200-day direction on Dukascopy daily candles. Pure: bars in, trades and verdicts out. Imported only by tools/drift_trials.py, a research script and not an app entrypoint. Pinned by tests/backtest/test_drift_trials.py. Delete this entry if it is wired or removed."
+    },
+    {
+      "module": "backend.src.services.reversal_engine.historical_bars",
+      "file": "backend/src/services/reversal_engine/historical_bars.py",
+      "loc": 242,
+      "class": "unwired-tool",
+      "reason": "Dukascopy tick files to M1 bars and the resumable download (docs/todo/reversal-engine/260). Research only, off the trading path. Imported by historical_signals, edge_trials and tools/re_dukascopy_replay.py, none of which is an app entrypoint. Pinned by tests/reversal_engine/test_historical_replay.py. Delete this entry if it is wired or removed."
+    },
+    {
+      "module": "backend.src.services.reversal_engine.historical_signals",
+      "file": "backend/src/services/reversal_engine/historical_signals.py",
+      "loc": 154,
+      "class": "unwired-tool",
+      "reason": "Regenerates Reversal Engine signals from M1 bars alone, through the live level_detector and entry_zone_from_level (docs/todo/reversal-engine/260). Pure and research only. Imported by tools/re_dukascopy_replay.py and tools/edge_trials_2025.py. Pinned by tests/reversal_engine/test_historical_replay.py. Delete this entry if it is wired or removed."
+    },
+    {
+      "module": "backend.src.services.reversal_engine.replay_verdict",
+      "file": "backend/src/services/reversal_engine/replay_verdict.py",
+      "loc": 94,
+      "class": "unwired-tool",
+      "reason": "The pre-registered bar the Dukascopy replay is judged by, kept as code so a report cannot grade itself on a softer curve. Imported by the two research tools only. Pinned by tests/reversal_engine/test_replay_verdict.py. Delete this entry if it is wired or removed."
+    },
+    {
+      "module": "backend.src.services.reversal_engine.weight_replay",
+      "file": "backend/src/services/reversal_engine/weight_replay.py",
+      "loc": 103,
+      "class": "unwired-tool",
+      "reason": "docs/todo/017 step 1b: walk-forward replay of the Reversal batch model under different training weights, to decide whether re_ml_time_decay_enabled's weights beat today's positional ones. Pure; its caller is tools/ml_weight_replay.py, which is not an app entrypoint. Research only: it never loads, saves or replaces the live model. First run 2026-10-14: no variant beat today's. Pinned by tests/reversal_engine/test_weight_replay.py. Delete this entry if it is wired or removed."
+    },
+    {
+      "module": "backend.src.services.analytics.regime_table",
+      "file": "backend/src/services/analytics/regime_table.py",
+      "loc": 86,
+      "class": "unwired-tool",
+      "reason": "docs/todo/017 item 4: expectancy by market-state cell (trend with/against/range, volatility, session) with 2-hour clustered intervals and both halves of the sample. Pure; the database read is in tools/regime_table.py, which is its caller and is not an app entrypoint. Whether it gets a panel is not decided. Pinned by tests/analytics/test_regime_table.py. Delete this entry if it is wired or removed."
+    }
+  ]
+}

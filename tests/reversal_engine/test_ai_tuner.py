@@ -1,0 +1,329 @@
+"""Letting an AI set the engine's capability switches, safely.
+
+Owner request, 2026-09-11: a button that has the configured AI read the
+market and set the parameters itself, re-analysing every fifteen minutes,
+plus a one-shot Recommend that uses the ML evidence and the AI together.
+
+**This writes live trading settings from a model's free-text output**, so
+almost all of the code is refusal. The tests below are the refusals. What
+the AI is allowed to touch is a fixed list; everything else it returns is
+dropped, every number it returns is clamped to the same range the form
+allows, and anything it says that cannot be parsed changes nothing at all.
+
+Sizing is not on the list and never will be by this route.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+
+import pytest
+
+from backend.src.services.reversal_engine import ai_tuner
+
+
+class TestWhatItMayChange:
+    def test_the_capability_switches_are_tunable(self):
+        assert "re_atr_barriers_enabled" in ai_tuner.TUNABLE
+        assert "meta_label_threshold" in ai_tuner.TUNABLE
+        assert "re_blocked_level_types" in ai_tuner.TUNABLE
+
+    def test_sizing_is_not_tunable_by_an_ai(self):
+        """Position sizing is on this repo's stop-and-ask list. An AI
+        adjusting it every fifteen minutes without a human in the loop is
+        the single worst thing this feature could be allowed to do."""
+        assert "vol_target_sizing_enabled" not in ai_tuner.TUNABLE
+        assert "correlated_exposure_cap_lots" not in ai_tuner.TUNABLE
+
+    def test_live_execution_is_not_tunable_by_an_ai(self):
+        assert "re_live_execution" not in ai_tuner.TUNABLE
+        assert not any("live" in k for k in ai_tuner.TUNABLE)
+
+
+class TestSanitising:
+    def test_an_unknown_key_is_dropped(self):
+        out = ai_tuner.sanitise({"re_live_execution": 1, "max_lot_size": 99,
+                                 "meta_label_threshold": 0.6})
+        assert out == {"meta_label_threshold": 0.6}
+
+    def test_a_number_beyond_the_allowed_range_is_clamped_not_refused(self):
+        """Clamped rather than dropped: a model asking for a 40x ATR stop
+        has misjudged the scale, not the direction, and the clamp is the
+        same one the form applies to a human."""
+        assert ai_tuner.sanitise({"re_atr_stop_mult": 40.0})["re_atr_stop_mult"] == 5.0
+        assert ai_tuner.sanitise({"re_atr_stop_mult": -3.0})["re_atr_stop_mult"] == 0.2
+
+    def test_a_boolean_comes_through_as_zero_or_one(self):
+        assert ai_tuner.sanitise({"entry_trigger_enabled": True})["entry_trigger_enabled"] == 1
+        assert ai_tuner.sanitise({"entry_trigger_enabled": "yes"})["entry_trigger_enabled"] == 1
+        assert ai_tuner.sanitise({"entry_trigger_enabled": 0})["entry_trigger_enabled"] == 0
+
+    def test_a_refusal_list_keeps_only_real_level_types(self):
+        out = ai_tuner.sanitise({"re_blocked_level_types": ["round_5", "nonsense", "UNICORN"]})
+        assert out["re_blocked_level_types"] == "round_5,unicorn"
+
+    def test_a_refusal_list_that_would_block_everything_is_refused(self):
+        """A model that decides nothing is tradeable has not tuned the
+        engine, it has switched it off, and it must not be able to do that
+        silently through a settings field."""
+        from backend.src.services.risk import capability_gates as cg
+        out = ai_tuner.sanitise({"re_blocked_level_types": list(cg.KNOWN_LEVEL_TYPES)})
+        assert "re_blocked_level_types" not in out
+
+    def test_junk_values_are_dropped_rather_than_coerced_to_zero(self):
+        out = ai_tuner.sanitise({"meta_label_threshold": "quite high"})
+        assert out == {}
+
+    def test_nothing_in_gives_nothing_out(self):
+        assert ai_tuner.sanitise({}) == {}
+        assert ai_tuner.sanitise(None) == {}
+
+
+class TestParsingWhatTheModelSaid:
+    def test_it_reads_a_plain_json_object(self):
+        raw = json.dumps({"settings": {"meta_label_threshold": 0.7},
+                          "rationale": "gate is too loose"})
+        got = ai_tuner.parse_response(raw)
+        assert got["settings"] == {"meta_label_threshold": 0.7}
+        assert "loose" in got["rationale"]
+
+    def test_it_digs_the_object_out_of_a_fenced_block(self):
+        raw = "Here you go:\n```json\n{\"settings\": {\"entry_trigger_enabled\": 1}}\n```"
+        assert ai_tuner.parse_response(raw)["settings"]["entry_trigger_enabled"] == 1
+
+    def test_unparseable_output_changes_nothing_and_says_so(self):
+        got = ai_tuner.parse_response("I am unable to help with that.")
+        assert got["settings"] == {}
+        assert got["error"]
+
+    def test_an_empty_response_changes_nothing(self):
+        assert ai_tuner.parse_response("")["settings"] == {}
+
+
+class TestTheAutoLoop:
+    def test_it_does_nothing_while_the_switch_is_off(self, monkeypatch):
+        called = []
+        monkeypatch.setattr(ai_tuner, "recommend",
+                            lambda *a, **k: called.append(1))
+        out = asyncio.run(ai_tuner.auto_tune(bridge=None, rs={"re_ai_tuning_enabled": 0}))
+        assert out["skipped"] == "off"
+        assert called == []
+
+    def test_with_the_switch_on_it_applies_what_it_is_given(self, monkeypatch):
+        applied = {}
+        monkeypatch.setattr(ai_tuner, "_write_settings", lambda d: applied.update(d))
+
+        async def _fake(bridge, rs=None):
+            return {"settings": {"meta_label_threshold": 0.65},
+                    "rationale": "tightening", "evidence": {}}
+        monkeypatch.setattr(ai_tuner, "recommend", _fake)
+
+        out = asyncio.run(ai_tuner.auto_tune(bridge=None,
+                                             rs={"re_ai_tuning_enabled": 1}))
+        assert applied == {"meta_label_threshold": 0.65}
+        assert out["applied"] == {"meta_label_threshold": 0.65}
+
+    def test_a_recommendation_it_cannot_use_writes_nothing(self, monkeypatch):
+        applied = {}
+        monkeypatch.setattr(ai_tuner, "_write_settings", lambda d: applied.update(d))
+
+        async def _fake(bridge, rs=None):
+            return {"settings": {}, "rationale": "", "error": "no json"}
+        monkeypatch.setattr(ai_tuner, "recommend", _fake)
+
+        asyncio.run(ai_tuner.auto_tune(bridge=None, rs={"re_ai_tuning_enabled": 1}))
+        assert applied == {}
+
+    def test_the_ai_failing_never_raises_into_the_engine_loop(self, monkeypatch):
+        async def _boom(bridge, rs=None):
+            raise RuntimeError("provider down")
+        monkeypatch.setattr(ai_tuner, "recommend", _boom)
+        out = asyncio.run(ai_tuner.auto_tune(bridge=None,
+                                             rs={"re_ai_tuning_enabled": 1}))
+        assert "error" in out
+
+
+class TestTheEngineLoopEntryPoint:
+    def test_tune_once_reads_the_switch_itself(self, monkeypatch):
+        """The engine decides WHEN; this decides whether and what. Keeping
+        the settings read here is what lets the service stay an
+        orchestrator and stay under its line ceiling."""
+        seen = {}
+
+        async def _fake(bridge, rs=None):
+            seen["rs"] = rs
+            return {"skipped": "off"}
+        monkeypatch.setattr(ai_tuner, "auto_tune", _fake)
+        monkeypatch.setattr("backend.src.db.database.get_risk_settings",
+                            lambda: {"re_ai_tuning_enabled": 0})
+        asyncio.run(ai_tuner.tune_once(bridge=None))
+        assert seen["rs"] == {"re_ai_tuning_enabled": 0}
+
+    def test_an_unreadable_settings_row_does_not_raise(self, monkeypatch):
+        def _boom():
+            raise RuntimeError("db gone")
+        monkeypatch.setattr("backend.src.db.database.get_risk_settings", _boom)
+        assert "error" in asyncio.run(ai_tuner.tune_once(bridge=None))
+
+
+class TestTheEvidenceItIsGiven:
+    """The 2026-09-11 run proposed a 2.0x ATR target that neither the reach
+    data nor the exit-policy sweep supports. The model reasoned correctly;
+    it was shown only the fitted barriers. Both are now in the payload."""
+
+    def _evidence(self, monkeypatch, summary):
+        monkeypatch.setattr(
+            "backend.src.services.reversal_engine.research_lab.last_summary",
+            lambda: summary)
+        for name, value in (("excursion_observations", []),
+                            ("closed_executed_rows", [])):
+            monkeypatch.setattr(
+                f"backend.src.services.reversal_engine.measure_repo.{name}",
+                lambda *a, **k: value)
+        monkeypatch.setattr(
+            "backend.src.services.broker.tca_repo.mean_cost_r",
+            lambda *a, **k: (0.3, 100))
+        return asyncio.run(ai_tuner.gather_evidence(bridge=None, rs={}))
+
+    def test_the_reach_distribution_reaches_the_model(self, monkeypatch):
+        ev = self._evidence(monkeypatch, {
+            "reach": {"n": 500, "median_r": 0.43,
+                      "reached": {"1.0R": 0.094}}})
+        assert ev["reach"]["median_r"] == 0.43
+
+    def test_the_exit_policy_sweep_reaches_the_model(self, monkeypatch):
+        ev = self._evidence(monkeypatch, {
+            "sweep": [{"stop_pts": 2.0, "target_pts": 12.0,
+                       "expectancy": 0.48, "ci_low": -0.36, "ci_high": 1.33}]})
+        assert ev["exit_policy_sweep"][0]["target_pts"] == 12.0
+
+    def test_with_no_study_run_it_says_so_rather_than_sending_nothing(self, monkeypatch):
+        """Silence would read as "there is no reach data", which the model
+        cannot distinguish from "nothing travels anywhere"."""
+        ev = self._evidence(monkeypatch, {})
+        assert "no research study" in ev["study_note"]
+
+    def test_the_prompt_tells_it_how_to_read_them(self):
+        prompt = ai_tuner._build_prompt({"reach": {}, "exit_policy_sweep": []})
+        assert "median reach" in prompt
+        assert "straddle zero" in prompt
+        assert "DIAGNOSIS" in prompt
+
+
+class TestItSaysWhatItDecided:
+    """A pass that changes nothing must still leave a trace.
+
+    The fifteen-minute loop runs against an engine with live execution on,
+    and until this existed only an APPLIED setting was logged. A model that
+    deliberately proposed nothing, a response whose JSON could not be read,
+    and a proposal that `sanitise` dropped in full were the same silence --
+    so there was no way to tell a working tuner from a dead provider. See
+    the session of 2026-09-14, where two confirmed passes reached DeepSeek
+    and returned 200 and left nothing in the log at all.
+    """
+
+    def test_a_pass_that_changes_nothing_logs_its_reasoning(self, monkeypatch, caplog):
+        monkeypatch.setattr(ai_tuner, "_write_settings", lambda d: None)
+
+        async def _fake(bridge, rs=None):
+            return {"settings": {}, "evidence": {},
+                    "rationale": "the fit and the sweep disagree"}
+        monkeypatch.setattr(ai_tuner, "recommend", _fake)
+
+        with caplog.at_level("INFO", logger=ai_tuner.log.name):
+            asyncio.run(ai_tuner.auto_tune(bridge=None,
+                                           rs={"re_ai_tuning_enabled": 1}))
+
+        assert any("the fit and the sweep disagree" in r.getMessage()
+                   for r in caplog.records), \
+            "a no-change pass left no record of why"
+
+    def test_a_provider_failure_is_not_logged_as_no_change_needed(
+            self, monkeypatch, caplog):
+        """The distinction that matters: a broken provider must not read
+        like a model that considered the evidence and declined."""
+        monkeypatch.setattr(ai_tuner, "_write_settings", lambda d: None)
+
+        async def _fake(bridge, rs=None):
+            return {"settings": {}, "rationale": "", "evidence": {},
+                    "error": "could not read JSON from the response"}
+        monkeypatch.setattr(ai_tuner, "recommend", _fake)
+
+        with caplog.at_level("INFO", logger=ai_tuner.log.name):
+            asyncio.run(ai_tuner.auto_tune(bridge=None,
+                                           rs={"re_ai_tuning_enabled": 1}))
+
+        assert any("could not read JSON from the response" in r.getMessage()
+                   for r in caplog.records), \
+            "a provider failure was indistinguishable from a quiet pass"
+
+
+class TestItSaysHowOldTheEvidenceIs:
+    """`study_note` used to fire only when the study was MISSING. A study
+    that had run once and then gone stale reached the model as a bare
+    `study_ran_at` float with nothing telling it to discount the numbers.
+
+    On 2026-09-16 the stored sweep was from 2026-09-12 and was still being
+    presented as the reach evidence. Scheduling the study shortens that gap;
+    it does not close it, because a scheduled job that FAILS leaves
+    yesterday's numbers looking exactly as current as today's would.
+    """
+
+    def _evidence(self, monkeypatch, summary):
+        monkeypatch.setattr(
+            "backend.src.services.reversal_engine.research_lab.last_summary",
+            lambda: summary)
+        for name, value in (("excursion_observations", []),
+                            ("closed_executed_rows", [])):
+            monkeypatch.setattr(
+                f"backend.src.services.reversal_engine.measure_repo.{name}",
+                lambda *a, **k: value)
+        monkeypatch.setattr(
+            "backend.src.services.broker.tca_repo.mean_cost_r",
+            lambda *a, **k: (0.3, 100))
+        return asyncio.run(ai_tuner.gather_evidence(bridge=None, rs={}))
+
+    def _summary(self, age_s):
+        return {"ran_at": time.time() - age_s,
+                "reach": {"n": 500, "median_r": 0.43},
+                "sweep": [{"stop_pts": 2.0, "target_pts": 12.0}]}
+
+    def test_a_study_from_this_morning_carries_no_warning(self, monkeypatch):
+        ev = self._evidence(monkeypatch, self._summary(3 * 3600))
+        assert "study_note" not in ev
+
+    def test_a_study_from_four_days_ago_says_it_is_stale(self, monkeypatch):
+        ev = self._evidence(monkeypatch, self._summary(4 * 86400))
+        assert "stale" in ev["study_note"].lower()
+
+    def test_the_warning_names_the_age_so_the_model_can_weigh_it(self, monkeypatch):
+        ev = self._evidence(monkeypatch, self._summary(4 * 86400))
+        assert "96" in ev["study_note"]
+
+    def test_the_age_is_reported_even_when_the_study_is_fresh(self, monkeypatch):
+        """The model is told how old the numbers are on every pass, not only
+        when they are bad enough to complain about."""
+        ev = self._evidence(monkeypatch, self._summary(3 * 3600))
+        assert round(ev["study_age_hours"]) == 3
+
+    def test_a_summary_with_no_timestamp_is_treated_as_stale(self, monkeypatch):
+        """A summary written by a version that did not record `ran_at` cannot
+        be shown to be current, and unknown age is not the same as fresh."""
+        ev = self._evidence(monkeypatch, {"reach": {"n": 500}})
+        assert "stale" in ev["study_note"].lower()
+
+    def test_no_study_at_all_still_says_no_study_was_run(self, monkeypatch):
+        """The original message is the right one for the original case and
+        must not be replaced by the staleness wording."""
+        ev = self._evidence(monkeypatch, {})
+        assert "no research study" in ev["study_note"]
+
+    def test_the_prompt_tells_it_to_discount_stale_evidence(self):
+        """Built from an EMPTY evidence dict on purpose. `_build_prompt` dumps
+        the evidence into the prompt verbatim, so passing a `study_note` in and
+        then finding it in the output asserts nothing about the instructions --
+        it finds its own input. The guidance has to be in the Notes section."""
+        prompt = ai_tuner._build_prompt({})
+        assert "study_age_hours" in prompt
+        assert "stale" in prompt.lower()

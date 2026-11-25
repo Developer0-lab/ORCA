@@ -1,0 +1,289 @@
+"""Max TP hit checker + one-off backfill -- extracted verbatim (no logic
+changes) from core/engine.py's SimulationEngine._max_tp_checker_loop's
+per-cycle sweep body, _backfill_max_tp_hit_corrected, and the module-level
+pure helper _tp_level_from_extreme, as part of the core/engine.py migration
+series. See docs/todo/refactor/core-max-tp-hit-migration/020-*.md.
+
+Read-only candle fetches plus DB writes to max_tp_hit -- no order is ever
+placed, closed, or modified.
+
+The `_max_tp_checker_loop` while/sleep(90)/sleep(300) shell stays in
+engine.py (same split as _tp_safety_net_loop/tp_safety_net_sweep);
+`max_tp_checker_sweep` here is just its per-cycle body. `backfill_max_tp_hit_corrected`
+has no loop wrapper in the original, so it's ported in full, including its
+own startup delay.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Any
+
+from backend.src.db import database as db_module
+from backend.src.services.positions import max_tp_repo as _repo
+
+log = logging.getLogger(__name__)
+
+
+# Written to max_tp_hit when the question cannot be asked of this trade at
+# all, as opposed to NOT_REACHED which is the real answer "price never got to
+# TP1". History renders it as a plain dash; without it these rows sat on
+# "..." / "Updating in 30 min" forever, which is what made Max TP look missing
+# across most of the Closed Trades table (2026-08-07).
+NOT_APPLICABLE = "n/a"
+NOT_REACHED = "none"
+
+
+def _tp_level_from_extreme(direction: str, extreme: float, tp_source_fn) -> str:
+    """Highest TP level (TP1..TP8) crossed by `extreme` in the trade's
+    favourable direction. `tp_source_fn(i)` returns the TP price for level i
+    (1-indexed) or None. Continues past a None mid-sequence rather than
+    stopping, since a gap (e.g. tp2 NULL but tp3-tp8 populated) must not hide
+    every level beyond it."""
+    hit = NOT_REACHED
+    for i in range(1, 9):
+        tp = tp_source_fn(i)
+        if tp is None:
+            continue
+        tp = float(tp)
+        if direction == "BUY" and extreme >= tp:
+            hit = f"TP{i}"
+        elif direction == "SELL" and extreme <= tp:
+            hit = f"TP{i}"
+    return hit
+
+
+def _tp_source_for(t: dict):
+    """Which TP ladder this trade's Max TP is measured against.
+
+    A Telegram channel's trade is graded on the channel's own targets (the
+    v0.23 choice: how far price ran against what the signal promised), even
+    when a strategy or template overrode them.
+
+    A trade one of the app's own engines opened is graded on the TPs it was
+    actually given. The engine's signal ladder is its internal one -- for the
+    Reversal Engine $1 rungs measured from the entry ZONE, not the fill --
+    and a template then places the real trade with its own, wider ladder.
+    Measured against the signal's, a trade stopped out short of its own TP1
+    read "TP3" (demo ticket 2170604954, 2026-10-12). Falls back to the
+    signal ladder when the trade carries no TPs of its own.
+    """
+    from backend.src.services.analytics.labels import is_internal_engine
+
+    if (is_internal_engine(t.get("tg_source") or "")
+            and any(t.get(f"tp{i}") is not None for i in range(1, 9))):
+        # The trade's ladder alone: filling its empty rungs from the signal's
+        # would mix two ladders and read a $1 signal rung as the trade's TP5.
+        return lambda idx: t.get(f"tp{idx}")
+
+    def _tp_source(idx: int):
+        sig_v = t.get(f"sig_tp{idx}")
+        return sig_v if sig_v is not None else t.get(f"tp{idx}")
+    return _tp_source
+
+
+# app_config key marking that engine rows graded on the signal ladder have
+# been cleared for the sweep to recompute. Once only: a value written after
+# the repair is already on the right ladder.
+_ENGINE_LADDER_REPAIR_KEY = "max_tp_engine_ladder_repaired"
+
+
+def repair_engine_max_tp_once() -> int:
+    """Clear max_tp_hit on closed engine trades graded before `_tp_source_for`
+    so the next sweep recomputes them. Returns how many rows it cleared."""
+    from backend.src.services.analytics.labels import is_internal_engine
+
+    if db_module.get_app_config(_ENGINE_LADDER_REPAIR_KEY) == "1":
+        return 0
+    ids = [trade_id for trade_id, tg_source in _repo.get_closed_trades_with_max_tp_source()
+           if is_internal_engine(tg_source or "")]
+    _repo.clear_max_tp_hit(ids)
+    db_module.set_app_config(_ENGINE_LADDER_REPAIR_KEY, "1")
+    if ids:
+        log.info("[MaxTP] cleared %d engine trades for regrading on their own TPs", len(ids))
+    return len(ids)
+
+
+def _has_tp_ladder(t: dict) -> bool:
+    """Whether this trade has any TP level to measure an extreme against --
+    either its own or its originating signal's. Trades run purely on a
+    trailing stop, and EA-template trades whose targets live in the template,
+    have neither."""
+    return any(
+        t.get(f"sig_tp{i}") is not None or t.get(f"tp{i}") is not None
+        for i in range(1, 9)
+    )
+
+
+def fill_realised_r() -> int:
+    """Give this node's own ledger rows their realised R, and send them on.
+
+    The Trades page's R column for a trade the OTHER node opened comes from
+    the ledger, which only had the frozen close_trade's close-time plan ratio
+    (see sync_repo's `r_realised` note). This node holds the figure for its
+    own trades -- net P&L over the initial risk, the same number its own
+    Trades page shows -- so it writes it into its own row and pushes the row;
+    the other node also picks it up on its periodic ledger pull. A trade with
+    no risk figure stays blank. Returns how many rows it filled.
+
+    Reads and ledger writes only: no order is placed, closed or modified.
+    """
+    from backend.src.services.cluster import sync_repo
+    from backend.src.services.cluster.sync.ledger import push_trade_closed
+
+    backlog = sync_repo.own_rows_missing_realised_r(sync_repo.get_or_create_node_id())
+    if not backlog:
+        return 0
+    realised = db_module.get_rr_map_by_ticket()
+    filled = 0
+    for row in backlog:
+        r = realised.get(str(row["mt5_ticket"]))
+        if r is None:
+            continue
+        push_trade_closed({**row, "r_realised": round(float(r), 4)})
+        filled += 1
+    return filled
+
+
+async def max_tp_checker_sweep(bridge: Any) -> None:
+    try:
+        fill_realised_r()
+    except Exception as e:                       # noqa: BLE001
+        log.debug("fill_realised_r failed: %s", e)
+    try:
+        repair_engine_max_tp_once()
+    except Exception as e:                       # noqa: BLE001
+        log.debug("repair_engine_max_tp_once failed: %s", e)
+    cutoff = time.time() - 1800  # 30 minutes ago
+    pending = db_module.get_trades_pending_max_tp(cutoff)
+    for t in pending:
+        try:
+            from_ts = float(t.get("open_time") or 0)
+            to_ts = float(t.get("close_time") or 0)
+            direction = (t.get("direction") or "").upper()
+            if not from_ts or not to_ts or not direction:
+                # Left as NOT_REACHED rather than NOT_APPLICABLE: both render
+                # as a dash, and this path is characterized behaviour the
+                # engine.py extraction suites still lock in.
+                db_module.save_max_tp_hit(t["trade_id"], NOT_REACHED)
+                continue
+
+            if not _has_tp_ladder(t):
+                db_module.save_max_tp_hit(t["trade_id"], NOT_APPLICABLE)
+                continue
+
+            # An open_time at or after close_time makes get_candles_range an
+            # empty (backwards) query, which read as "bridge offline, retry
+            # next cycle" and so retried every 5 minutes forever. Seen on
+            # adopted MT5_DIRECT positions whose open_time was recorded from
+            # the wrong deal; nothing recoverable is left to measure.
+            if from_ts >= to_ts:
+                db_module.save_max_tp_hit(t["trade_id"], NOT_APPLICABLE)
+                continue
+
+            candles = await bridge.get_candles_range(from_ts, to_ts, "M1")
+            if not candles:
+                # Bridge offline or no data — skip, will retry next cycle
+                continue
+
+            if direction == "BUY":
+                extreme = max(float(c.get("high", 0) or 0) for c in candles)
+            else:
+                extreme = min(float(c.get("low", float("inf")) or float("inf")) for c in candles)
+
+            hit = _tp_level_from_extreme(direction, extreme, _tp_source_for(t))
+
+            db_module.save_max_tp_hit(t["trade_id"], hit)
+            log.info(
+                "max_tp_hit trade=%s dir=%s extreme=%.2f -> %s",
+                t["trade_id"], direction, extreme, hit,
+            )
+
+            try:
+                from backend.src.services.cluster.sync.ledger import push_trade_closed
+                net_pnl = t.get("net_pnl")
+                push_trade_closed({
+                    "trade_id": t["trade_id"],
+                    "engine": "main",
+                    "direction": direction,
+                    "strategy": t.get("strategy", ""),
+                    "open_time": t.get("open_time"),
+                    "close_time": t.get("close_time"),
+                    "pnl_dollars": net_pnl,
+                    "outcome": (
+                        "win" if (net_pnl or 0) > 0.5
+                        else ("loss" if (net_pnl or 0) < -0.5 else "be")
+                    ),
+                    "tg_source": t.get("tg_source"),
+                    "mt5_ticket": t.get("mt5_ticket"),
+                    "max_tp_hit": hit,
+                })
+            except Exception as _le:
+                log.debug("[Ledger] max_tp_hit push failed: %s", _le)
+        except Exception as _te:
+            log.debug("max_tp_hit trade=%s error: %s", t.get("trade_id"), _te)
+
+
+async def backfill_max_tp_hit_corrected(bridge: Any) -> None:
+    """One-off (2026-07-18): recompute max_tp_hit for every already-closed
+    trade using the corrected open_time->close_time window, replacing
+    values computed under the old close_time+30min window that could
+    attribute post-close continuation moves to a trade that was already
+    flat (see max_tp_checker_sweep docstring). Safe to leave running at
+    startup — recompute-and-compare is idempotent, and it no-ops once
+    every row already matches its corrected value."""
+    await asyncio.sleep(120)  # let the bridge connect first
+    try:
+        trades = await db_module.to_db_thread(db_module.get_trades_with_max_tp_set)
+    except Exception as e:
+        log.warning("[MaxTP-backfill] fetch failed: %s", e)
+        return
+    corrected = 0
+    for t in trades:
+        try:
+            direction = (t.get("direction") or "").upper()
+            from_ts = float(t.get("open_time") or 0)
+            to_ts = float(t.get("close_time") or 0)
+            if not direction or not from_ts or not to_ts:
+                continue
+            candles = await bridge.get_candles_range(from_ts, to_ts, "M1")
+            if not candles:
+                continue
+            if direction == "BUY":
+                extreme = max(float(c.get("high", 0) or 0) for c in candles)
+            else:
+                extreme = min(float(c.get("low", float("inf")) or float("inf")) for c in candles)
+
+            hit = _tp_level_from_extreme(direction, extreme, _tp_source_for(t))
+            if hit == t.get("old_hit"):
+                continue
+
+            await db_module.to_db_thread(db_module.save_max_tp_hit, t["trade_id"], hit)
+            corrected += 1
+            log.info("[MaxTP-backfill] trade=%s %s -> %s", t["trade_id"], t.get("old_hit"), hit)
+
+            try:
+                from backend.src.services.cluster.sync.ledger import push_trade_closed
+                net_pnl = t.get("net_pnl")
+                push_trade_closed({
+                    "trade_id": t["trade_id"],
+                    "engine": "main",
+                    "direction": direction,
+                    "strategy": t.get("strategy", ""),
+                    "open_time": t.get("open_time"),
+                    "close_time": t.get("close_time"),
+                    "pnl_dollars": net_pnl,
+                    "outcome": (
+                        "win" if (net_pnl or 0) > 0.5
+                        else ("loss" if (net_pnl or 0) < -0.5 else "be")
+                    ),
+                    "tg_source": t.get("tg_source"),
+                    "mt5_ticket": t.get("mt5_ticket"),
+                    "max_tp_hit": hit,
+                })
+            except Exception as _le:
+                log.debug("[MaxTP-backfill] ledger push failed trade=%s: %s", t["trade_id"], _le)
+        except Exception as _te:
+            log.debug("[MaxTP-backfill] trade=%s error: %s", t.get("trade_id"), _te)
+    log.info("[MaxTP-backfill] done: %d/%d trades corrected", corrected, len(trades))

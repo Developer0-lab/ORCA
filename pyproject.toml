@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forex-trader"
+version = "1.0.0"
+description = "FOREX Trader — XAUUSD Gold trading app with a React dashboard"
+requires-python = ">=3.11"
+# Kept in lockstep with requirements.txt (tests/refactor/test_pyproject_metadata.py
+# fails if requirements.txt declares a package this list omits). requirements.txt
+# remains the install source of truth; this list makes `pip install .` / wheel
+# builds pull the same runtime set instead of a broken subset.
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "itsdangerous>=2.2.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "anthropic>=0.36.0",
+    "telethon>=1.36.0",
+    "cryptg>=0.4.0",
+    "PyYAML>=6.0",
+    "scikit-learn>=1.3.0",
+    "numpy>=1.26.0",
+    "joblib>=1.3.0",
+    "lightgbm>=4.0.0",
+    "yfinance>=0.2.40",
+    "MetaTrader5>=5.0.45; sys_platform == 'win32'",
+    "keyring",
+    "websockets>=13.0",
+    "cryptography>=42.0",
+    "python-dateutil>=2.9.0",
+    "psutil>=6.0.0",
+    "matplotlib>=3.8.0",
+]
+
+[project.scripts]
+forex-trader = "run:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+# frontend/ is TypeScript now, not a Python package — including it made the
+# wheel carry an empty directory and, worse, made `include` look like it still
+# described where the UI lives.
+include = ["backend*"]
+
+[tool.pytest.ini_options]
+# The suite reads the real clock: dpm_engine.detect_session() branches on the
+# current UTC hour and is_weekly_market_closed() returns True all weekend, so
+# every session-gated test passes on a Tuesday afternoon and fails on a Saturday
+# night with no code change in between. That made "did my change break this?"
+# unanswerable depending on the day.
+#
+# This plugin pins both readers to a fixed market-open instant so a run means
+# the same thing whenever it happens. Override the instant with
+# --market-clock=..., or drop the flag to reproduce real-clock behaviour.
+addopts = "-p tools.testing.fixed_clock"
+testpaths = ["tests"]

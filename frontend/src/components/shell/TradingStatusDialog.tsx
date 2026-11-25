@@ -1,0 +1,272 @@
+import { useState } from "react";
+import { api, ApiError } from "@/api/client";
+import { Button } from "@/components/shared/Button";
+import { DialogShell } from "@/components/shared/DialogShell";
+import { Tooltip } from "@/components/shared/Tooltip";
+
+/** What `/api/trading/status-badge` answers. The backend decides all of it. */
+export interface TradingStatus {
+  state: string;
+  label: string;
+  detail: string;
+  until: number | null;
+  resume_ts: number | null;
+  can_resume: boolean;
+  /** "vps" when this node hands its orders to the VPS and the badge is the
+   *  VPS's status. Pause and Resume here would write THIS node's database,
+   *  which is not the one placing orders, so the dialog offers no Pause. */
+  node?: "vps";
+  /** The VPS's own `can_resume`. When true the dialog offers Resume, sent to
+   *  the VPS (`/api/trading/remote/resume-all`), never to this node. */
+  can_resume_on_vps?: boolean;
+  /** The halt is a reached daily goal's, which plain Resume leaves in place
+   *  (owner, 2026-10-10). Offers "Resume anyway (ignore today's goal)",
+   *  which lifts it until midnight (owner, 2026-10-16). */
+  can_resume_past_goal?: boolean;
+  /** The VPS's own `can_resume_past_goal`; the override is sent to it. */
+  can_resume_past_goal_on_vps?: boolean;
+}
+
+/** What Resume does over the open-risk daily loss hold (owner, 2026-11-12). */
+const DAILY_LOSS_RESUME =
+  "Resuming waives the open-risk daily loss check until the trading day ends, " +
+  "so orders are no longer refused for the risk in open trades. The daily " +
+  "loss halt on closed trades still applies.";
+
+/** The override's wording. Spelled out so it is never mistaken for Resume. */
+const RESUME_ANYWAY = "Resume anyway (ignore today's goal)";
+
+interface TradingStatusDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  status: TradingStatus;
+  onChanged: () => void;
+}
+
+/**
+ * Stop new orders by hand, and start them again.
+ *
+ * The header used to carry two controls for this: a Pause button with its own
+ * dialog, and this badge with a resume-only popover. Two controls for one
+ * fact, on a bar that already runs out of room at 1024px — and the Pause
+ * button knew only about the governor's manual pause, so with a profit target
+ * reached it offered "Pause" while every automated entry was already held.
+ * Merged into the badge on 2026-09-22; the badge reads the backend's decision
+ * across all four mechanisms, so it is the one that knows most.
+ *
+ * Which half shows is `can_resume` — the backend's own answer to "would a
+ * human pressing Resume change anything". Nothing is re-derived here; a second
+ * opinion about a risk state produces two answers that drift.
+ *
+ * Resuming does more than clear a flag: the backend re-arms the post-close
+ * guards, because otherwise a resume after a give-back halt lasts exactly
+ * until the next trade closes. It goes through `resume-all`, not `resume`:
+ * three separate mechanisms stop new orders and `resume` lifts only the first.
+ *
+ * The pause wording is the NiceGUI original's: what a pause does NOT stop is
+ * the part people get wrong.
+ */
+export function TradingStatusDialog({
+  open,
+  onOpenChange,
+  status,
+  onChanged,
+}: TradingStatusDialogProps) {
+  const [hours, setHours] = useState("4");
+  const [until, setUntil] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  /** Runs one write, and reports the failure instead of closing on it. */
+  async function submit(request: () => Promise<unknown>) {
+    setBusy(true);
+    setError(null);
+    try {
+      await request();
+      onOpenChange(false);
+      onChanged();
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function pause() {
+    // A typed moment wins over the hours field, and an empty hours box must
+    // never become 0 — that is a pause already in the past, which the backend
+    // refuses but which would read here as "nothing happened".
+    if (until.trim()) {
+      const ts = Date.parse(until.trim().replace(" ", "T"));
+      if (Number.isNaN(ts)) {
+        setError("That is not a date and time. Use YYYY-MM-DD HH:MM.");
+        return;
+      }
+      void submit(() => api.post("/api/trading/pause", { until: ts / 1000 }));
+      return;
+    }
+    void submit(() => api.post("/api/trading/pause", { hours: Number(hours) || 4 }));
+  }
+
+  if (status.node === "vps") {
+    return (
+      <DialogShell open={open} onOpenChange={onOpenChange} title="VPS trading status">
+        <div data-testid="trading-status-dialog" className="space-y-3 text-xs text-ink-2">
+          <p className="font-semibold text-ink-1">{status.label}</p>
+          {status.detail && <p>{status.detail}</p>}
+          {status.state === "daily_loss" && status.can_resume_on_vps && (
+            <p className="text-ink-3">{DAILY_LOSS_RESUME}</p>
+          )}
+          <p data-testid="trading-status-vps-note" className="text-ink-3">
+            {status.can_resume_on_vps
+              ? "The VPS is the active trader, so this is its status. Resume " +
+                "is sent to the VPS and lifts whatever is holding its entries, " +
+                "as Resume does on the VPS itself. Pause it on the VPS."
+              : "The VPS is the active trader, so this is its status. Pause " +
+                "it on the VPS: from this node a pause would change only this " +
+                "node's settings, which place no orders."}
+          </p>
+          {error && <p role="alert" className="text-xs text-loss">{error}</p>}
+          <div className="flex justify-end gap-2 pt-1">
+            <Button variant="ghost" onClick={() => onOpenChange(false)}>
+              {status.can_resume_on_vps || status.can_resume_past_goal_on_vps
+                ? "Cancel" : "Close"}
+            </Button>
+            {status.can_resume_past_goal_on_vps && (
+              <Button
+                disabled={busy}
+                onClick={() => void submit(() => api.post("/api/trading/remote/resume-past-goal"))}
+              >
+                {busy ? "Resuming…" : RESUME_ANYWAY}
+              </Button>
+            )}
+            {status.can_resume_on_vps && (
+              <Button
+                disabled={busy}
+                onClick={() => void submit(() => api.post("/api/trading/remote/resume-all"))}
+              >
+                {busy ? "Resuming…" : "Resume Trading"}
+              </Button>
+            )}
+          </div>
+        </div>
+      </DialogShell>
+    );
+  }
+
+  // Halted with nothing a Resume would lift: a reached daily goal (owner,
+  // 2026-10-10). The detail says what does lift it. A Pause form here would
+  // write a shorter pause over the goal's. The one way past it from here is
+  // the explicitly worded override (owner, 2026-10-16), when the backend says
+  // the halt is the goal's.
+  if (status.state === "halted" && !status.can_resume) {
+    return (
+      <DialogShell open={open} onOpenChange={onOpenChange} title="Trading paused">
+        <div data-testid="trading-status-dialog" className="space-y-3 text-xs text-ink-2">
+          <p className="font-semibold text-ink-1">{status.label}</p>
+          {status.detail && <p>{status.detail}</p>}
+          {status.can_resume_past_goal && (
+            <p className="text-ink-3">
+              {RESUME_ANYWAY} lifts the goal's pause and stops the goal pausing
+              trading again until midnight. Tomorrow it counts as normal.
+            </p>
+          )}
+          {error && <p role="alert" className="text-xs text-loss">{error}</p>}
+          <div className="flex justify-end gap-2 pt-1">
+            <Button variant="ghost" onClick={() => onOpenChange(false)}>Close</Button>
+            {status.can_resume_past_goal && (
+              <Button
+                disabled={busy}
+                onClick={() => void submit(() => api.post("/api/trading/resume-past-goal"))}
+              >
+                {busy ? "Resuming…" : RESUME_ANYWAY}
+              </Button>
+            )}
+          </div>
+        </div>
+      </DialogShell>
+    );
+  }
+
+  return (
+    <DialogShell
+      open={open}
+      onOpenChange={onOpenChange}
+      title={status.can_resume ? "Resume trading?" : "Pause trading"}
+    >
+      <div data-testid="trading-status-dialog" className="space-y-3 text-xs text-ink-2">
+        <p className="font-semibold text-ink-1">{status.label}</p>
+        {status.detail && <p>{status.detail}</p>}
+
+        {status.can_resume && status.state === "daily_loss" ? (
+          <p className="text-ink-3">{DAILY_LOSS_RESUME}</p>
+        ) : status.can_resume ? (
+          <p className="text-ink-3">
+            Resuming lifts whatever is holding entries — a manual pause, a
+            tripped circuit breaker, or today's profit target — and restarts
+            the post-close guards' windows from now. Without that, resuming
+            after a give-back halt would be undone by the next trade that
+            closes.
+          </p>
+        ) : (
+          <>
+            <p>
+              While paused, all signal generators and Telegram signals continue
+              to run normally but no orders will be sent to MT5. Active trade
+              management (SL/TP monitoring) continues as normal.
+            </p>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="block">
+                Pause for (hours)
+                <Tooltip label="How long to stop sending new orders for, counted from now. Fractions are allowed — 0.25 is fifteen minutes. Trading resumes on its own when it expires.">
+                  <input
+                    aria-label="Pause for (hours)"
+                    className="num mt-0.5 w-full rounded border border-line bg-surface-1 px-2 py-1 text-ink-1"
+                    value={hours}
+                    onChange={(e) => setHours(e.target.value)}
+                  />
+                </Tooltip>
+                <span className="mt-0.5 block text-[10px] text-ink-3">
+                  0.25 is fifteen minutes.
+                </span>
+              </label>
+              <label className="block">
+                Or until (YYYY-MM-DD HH:MM)
+                <Tooltip label="A specific moment to pause until, which wins over the hours box beside it. A time already in the past is refused rather than stored — that would be a pause that never stops anything while this screen said it had.">
+                  <input
+                    aria-label="Or until (YYYY-MM-DD HH:MM)"
+                    className="mt-0.5 w-full rounded border border-line bg-surface-1 px-2 py-1 text-ink-1"
+                    value={until}
+                    onChange={(e) => setUntil(e.target.value)}
+                    placeholder="leave blank to use hours"
+                  />
+                </Tooltip>
+              </label>
+            </div>
+          </>
+        )}
+
+        {error && <p role="alert" className="text-xs text-loss">{error}</p>}
+
+        <div className="flex justify-end gap-2 pt-1">
+          <Button variant="ghost" onClick={() => onOpenChange(false)}>Cancel</Button>
+          {status.can_resume ? (
+            <Button
+              disabled={busy}
+              // No body: resume-all re-reads the live state itself rather
+              // than being told what to clear, because the click arrives
+              // seconds after the poll that drew the badge.
+              onClick={() => void submit(() => api.post("/api/trading/resume-all"))}
+            >
+              {busy ? "Resuming…" : "Resume Trading"}
+            </Button>
+          ) : (
+            <Button disabled={busy} onClick={pause}>
+              {busy ? "Pausing…" : "Pause now"}
+            </Button>
+          )}
+        </div>
+      </div>
+    </DialogShell>
+  );
+}

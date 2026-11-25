@@ -1,0 +1,717 @@
+"""Live (demo/real) MT5 order dispatch for a triggered Reversal Engine signal --
+extracted verbatim (no logic changes) from engine.py's _try_live_execute as
+part of task 040. See docs/todo/refactor/backend-foundation/040-*.md.
+
+Kept as its own file per backend-conventions' decomposition pattern --
+"the writes: dispatch/submit" get their own file, separate from the
+management/correlation concerns. _LiveExecuteMixin is composed into
+ReversalEngine (reversal_engine_service.py).
+
+Real-money surface: this is the one path in reversal_engine that can place
+an actual MT5 order. Task 050 (demo-account validation) is the only task
+in this pack allowed to exercise it against a live connection.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time as _time
+
+from backend.src.services.risk import lot_sizing
+from backend.src.services.risk import vol_target
+from backend.src.services.risk import governor as _gov
+from backend.src.services.risk import capability_gates as _caps
+import time
+import uuid
+from datetime import datetime, timezone
+from typing import Optional
+
+from backend.src.db import database as db_module
+from backend.src.services.reversal_engine import reversal_engine_repo as re_db
+from backend.src.services.reversal_engine import level_detector as ld
+from backend.src.services.positions.momentum_exhaustion import check_momentum_exhaustion
+from backend.src.utils import latency_trace as _lt
+
+_log = logging.getLogger("reversal_engine")
+
+_ML_BLOCK_THRESHOLD = 0.0     # block live execution if predicted R-multiple < 0
+
+
+def upcoming_events(rs: dict) -> list:
+    """Calendar events shaped for `event_tiers.check`, or [].
+
+    Fetched only when that gate is on: `get_events` can reach the network,
+    and a feed call on every fill attempt for a gate nobody enabled is a
+    cost with no benefit. `mins_until` is derived here because the calendar
+    stores absolute timestamps and the tier windows are relative.
+    """
+    if not rs.get("event_tier_gate_enabled"):
+        return []
+    try:
+        from backend.src.utils.news_calendar import get_events
+        now = _time.time()
+        return [dict(ev, mins_until=(float(ev.get("ts", 0)) - now) / 60.0)
+                for ev in get_events()]
+    except Exception:
+        return []
+
+
+class _LiveExecuteMixin:
+    async def _try_live_execute(self, sig: dict, trigger_price: float, tick=None) -> None:
+        """Execute a real MT5 trade if live execution is enabled and ML gate passes."""
+        try:
+            from backend.src.db import database as core_db
+            rs = core_db.get_risk_settings()
+            if not rs.get("re_live_execution", 0):
+                # Write a status so the orphan watchdog doesn't misfire on healthy
+                # virtual signals when live execution is deliberately disabled.
+                re_db.update_live_exec(sig["id"], status="skipped:live_disabled")
+                return
+
+            # Settings > Latency (docs/todo/006). No creation stamp: a Reversal
+            # signal waits for price to reach its zone, which is market time.
+            _lt_key = f"re:{sig.get('id')}"
+            _lt.mark(_lt_key, "e2_exec_start")
+            _lt.tag(_lt_key, pipeline="engine", label=f"Reversal {sig.get('signal_ref', '')}")
+
+            # Trading Schedule gate, Reversal Engine source (2026-07-24) --
+            # this engine performs well overnight (Asia) but loses during
+            # London/NY, the opposite of the Telegram channels, so each
+            # window independently allows/blocks it rather than one blanket
+            # automated-order switch. See core_trading_schedule.py.
+            from backend.src.services.risk.schedule import check_trading_schedule
+            _sched_ok, _sched_reason = check_trading_schedule(source="reversal_engine")
+            if not _sched_ok:
+                re_db.update_live_exec(sig["id"], status="skipped:schedule")
+                _log.info("[RE-Engine] schedule blocked live exec %s -- %s",
+                          sig.get("signal_ref"), _sched_reason)
+                return
+
+            # News blackout (Trading > News). Checked here rather than at
+            # signal creation for the same reason as the REF gate below: a
+            # signal sits pending for up to 2h waiting for price to enter its
+            # zone, so the window that matters is the one at fill time, not the
+            # one when the level was first spotted. Virtual tracking continues,
+            # so the ML still learns from what this skipped.
+            from backend.src.utils.news_calendar import check_news_blackout
+            _news_ok, _news_reason = check_news_blackout()
+            if not _news_ok:
+                re_db.update_live_exec(sig["id"], status="skipped:news")
+                _log.info("[RE-Engine] news blackout blocked live exec %s -- %s",
+                          sig.get("signal_ref"), _news_reason)
+                return
+
+            # Internal Engine Exposure guard (Trading > Strategy) -- OFF by
+            # default, in which case this is a no-op. See
+            # core_internal_exposure_guard.py for the modes and for the
+            # measured reason the default is off.
+            from backend.src.services.positions.core_internal_exposure_guard import check_internal_exposure
+            _exp_lot = lot_sizing.global_fixed_lot(rs) or 0.01
+            _exp_ok, _exp_reason = check_internal_exposure(
+                sig.get("direction", ""), _exp_lot, rs,
+            )
+            if not _exp_ok:
+                re_db.update_live_exec(sig["id"], status="skipped:exposure_guard")
+                _log.info("[RE-Engine] exposure guard blocked live exec %s -- %s",
+                          sig.get("signal_ref"), _exp_reason)
+                return
+
+            # REF confirmation gate (2026-07-31, OFF by default) -- only trade
+            # when the professional channels have just posted a matching entry.
+            # Checked here rather than at signal creation because the whole
+            # point is recency: a signal can sit pending for up to 2h, and the
+            # measured edge decays to nothing over exactly that span (see
+            # ref_confirmation's module docstring for the numbers and for why
+            # this is off by default). Virtual tracking continues regardless,
+            # so the ML keeps learning from what this would have skipped.
+            from backend.src.services.reversal_engine import ref_confirmation as _ref_conf
+            _ref_ok, _ref_reason = _ref_conf.check(
+                sig.get("direction", ""), sig.get("entry_low"), sig.get("entry_high"), rs,
+            )
+            if not _ref_ok:
+                re_db.update_live_exec(sig["id"], status="skipped:no_ref_confirmation")
+                _log.info("[RE-Engine] REF confirmation gate blocked live exec %s -- %s",
+                          sig.get("signal_ref"), _ref_reason)
+                return
+            if _ref_reason:
+                _log.info("[RE-Engine] REF confirmation for %s -- %s",
+                          sig.get("signal_ref"), _ref_reason)
+
+            # Fill-time re-evaluation (2026-07-17) -- a pending zone signal can
+            # sit anywhere from a couple of minutes to 4h (Reversal Runner/
+            # Adaptive Runner's expiry window) before price actually reaches
+            # its entry zone, but until now nothing re-checked the market
+            # bias or re-scored the ML prediction against CURRENT conditions
+            # before firing -- both were trusted exactly as they were at
+            # signal creation, however stale. Falls back to the creation-time
+            # ml_prob/htf_bias if the refresh itself fails (bridge offline,
+            # etc.) rather than skipping the gates entirely.
+            fresh_prob = sig.get("ml_prob")
+            direction  = sig.get("direction")
+            # Preserve the fresh vector for audit. A failed refresh leaves
+            # it None and the proven-edge gate still refuses the attempt.
+            _edge_feats = None
+            _fill_context, _fill_prediction = dict(sig), None
+            try:
+                h1_candles  = await self._bridge.get_candles("H1", 50)
+                m15_candles = await self._bridge.get_candles("M15", 80)
+                h4_candles  = await self._bridge.get_candles("H4", 6)
+                if h1_candles:
+                    fresh_htf = ld.get_htf_bias(h1_candles, h4_candles)
+                    fresh_atr = self._calc_atr(m15_candles or h1_candles)
+                    fresh_adx = self._calc_adx(h1_candles)
+                    fresh_session = ld.get_session(datetime.now(timezone.utc).hour)
+
+                    # Bias re-check -- the exact same "against-bias needs a
+                    # strong level score" rule _run_cycle already applies at
+                    # creation time, just re-evaluated against the CURRENT
+                    # bias instead of whatever it was when the signal fired.
+                    level_score = float(sig.get("level_score", 0.5) or 0.5)
+                    # reversal-engine/090: `level_score` used to grant a bypass here
+                    # (`and level_score < 0.75`), so a high-scoring level was trusted to
+                    # trade AGAINST the higher timeframe. level_score does not rank
+                    # outcomes -- its 0.9 band is the biggest losing band on record --
+                    # and on 2026-09-08 all six counter-bias signals cleared the bypass
+                    # and all six lost. When the owner's gate is ON the shared rule
+                    # decides; when it is OFF the original bypass behaviour stands, so
+                    # nothing changes until he turns it on.
+                    # 2026-09-12: and the whole branch stands down in the
+                    # Asian session when the owner asks for it. BOTH rules,
+                    # not just the gate -- while the gate is on the
+                    # level_score bypass below is a strict subset of it, so
+                    # exempting only the gate would quietly turn this switch
+                    # into "high-scoring levels only". Measured over all
+                    # 5,414 signals: in 00-07 UTC with-the-bias is 693 at
+                    # -$6.26 and against-it 621 at -$0.50; outside those
+                    # hours it is the other way round. Off by default, and
+                    # see capability_gates.asian_bias_exempt for why the
+                    # switch is read there rather than inside the shared
+                    # governor rule five other order routes also call.
+                    _asian_exempt = _caps.asian_bias_exempt(rs, fresh_session)
+                    _bias_block = None if _asian_exempt else \
+                        _gov.htf_bias_blocks(direction, fresh_htf, rs)
+                    if _bias_block or (not _asian_exempt and (
+                            (fresh_htf == "bullish" and direction == "SELL" and level_score < 0.75)
+                            or (fresh_htf == "bearish" and direction == "BUY" and level_score < 0.75))):
+                        re_db.store_ml_prob_at_fill(sig["id"], fresh_prob, fresh_htf)
+                        re_db.update_live_exec(sig["id"], status="bias_skipped")
+                        # bugs/038: say WHICH of the two rules refused. The
+                        # owner's trend gate never looks at level_score, so
+                        # printing "< 0.75" for it stated a falsehood (0.95 <
+                        # 0.75) and credited the level-score bypass with a
+                        # refusal it had not made. These lines are the only
+                        # visible evidence that the gate is working at all.
+                        _why = _bias_block or (
+                            f"counter-bias level_score={level_score:.2f} < 0.75"
+                        )
+                        _log.info(
+                            "[RE-Engine] bias gate blocked live exec %s -- htf now %s "
+                            "vs direction=%s: %s",
+                            sig.get("signal_ref"), fresh_htf, direction, _why,
+                        )
+                        return
+
+                    # Momentum-exhaustion / rejection re-check (2026-07-28) --
+                    # the bias re-check above only asks "does the wider H1/H4
+                    # trend still agree", which says nothing about whether the
+                    # market has already made (or reversed) its move on the
+                    # timeframe this signal actually trades. Deliberately a
+                    # fast local check, not an ML/AI call -- see
+                    # core/momentum_exhaustion.py's own docstring for why.
+                    _mx_ok, _mx_reason = check_momentum_exhaustion(
+                        direction, m15_candles or h1_candles, fresh_atr)
+                    if not _mx_ok:
+                        re_db.store_ml_prob_at_fill(sig["id"], fresh_prob, fresh_htf)
+                        re_db.update_live_exec(sig["id"], status="momentum_skipped")
+                        _log.info(
+                            "[RE-Engine] momentum re-check blocked live exec %s -- %s",
+                            sig.get("signal_ref"), _mx_reason,
+                        )
+                        return
+
+                    # Fresh ML re-score -- same feature set ml_engine.
+                    # extract_features used at creation, with every dynamic
+                    # input (bias/ATR/ADX/session/news/regime/drawdown/
+                    # agreement/REF cadence) recomputed against now instead
+                    # of signal-creation time. Static fields (level_type,
+                    # level_score, distance, rr_tp1, created_at) are left as
+                    # originally captured -- those describe the signal itself,
+                    # not current conditions.
+                    fresh_sig = dict(sig)
+                    _fill_context = fresh_sig
+                    fresh_sig["htf_bias"] = fresh_htf
+                    fresh_sig["h1_bias"]  = fresh_htf
+                    fresh_sig["adx"]      = fresh_adx
+                    fresh_sig["atr"]      = fresh_atr
+                    fresh_sig["session"]  = fresh_session
+                    # Same M15 RSI the creation path now supplies, recomputed
+                    # against current candles -- without it pro_rsi_delta and
+                    # pro_likeness would both fall back to neutral here and
+                    # this "same feature set" re-score would quietly differ
+                    # from the one it is meant to reproduce.
+                    try:
+                        from backend.src.services.positions.core_indicators import rsi_last
+                        fresh_sig["rsi14"] = rsi_last(
+                            [float(c.get("close", 0) or 0)
+                             for c in (m15_candles or h1_candles or [])])
+                    except Exception:
+                        pass
+                    try:
+                        from backend.src.utils.news_calendar import get_news_proximity_norm as _get_news
+                        fresh_sig["news_proximity_norm"] = _get_news()
+                    except Exception:
+                        pass
+                    try:
+                        fresh_sig["regime_score"] = core_db.get_regime_score(fresh_adx, fresh_atr)
+                        fresh_sig["equity_drawdown_pct"] = core_db.get_equity_drawdown_pct()
+                        fresh_sig["concurrent_agreement"] = core_db.get_concurrent_agreement(
+                            "reversal_engine", direction)
+                    except Exception:
+                        pass
+                    try:
+                        from backend.src.services.reversal_engine import ml_engine as re_ml
+                        fresh_sig["ref_discipline_score"], fresh_sig["ref_aggression_score"] = \
+                            re_ml.get_daily_research_scores()
+                    except Exception:
+                        pass
+                    cadence = await self._ref_cadence_stats()
+                    fresh_sig["minutes_since_last_ref"] = cadence[0]
+                    fresh_sig["ref_signals_today"]      = cadence[1]
+                    # Macro. Not a re_signals column, so it is absent from
+                    # the stored row and must be re-read here or this
+                    # "same feature set" re-score silently falls back to the
+                    # neutrals in five slots the creation-time vector filled.
+                    try:
+                        from backend.src.services.reversal_engine import re_macro
+                        fresh_sig.update(await re_macro.get_cycle_context())
+                    except Exception:
+                        pass
+                    # FVG context. Not a re_signals column either, so without
+                    # this all four FVG features (and pro_fvg_delta and
+                    # pro_likeness, which read them) fell back to "no gap" here
+                    # (2026-10-01). Measured again against the fresh candles,
+                    # exactly as creation measures it; a failure leaves the
+                    # same "no gap" neutrals creation would.
+                    try:
+                        from backend.src.services.reversal_engine.ict_patterns import fvg_context
+                        fresh_sig.update(fvg_context(
+                            m15_candles or h1_candles,
+                            float(sig.get("level_price") or 0),
+                            direction,
+                            fresh_atr,
+                        ))
+                    except Exception:
+                        pass
+
+                    from backend.src.services.reversal_engine import ml_engine as re_ml
+                    win_rate = re_db.get_recent_win_rate(20)
+                    fresh_feats = re_ml.extract_features(fresh_sig, win_rate)
+                    _edge_feats = fresh_feats
+                    if fresh_feats:
+                        _fp = re_ml.predict(re_ml.with_vol_tail(fresh_feats, fresh_sig))
+                        _fill_prediction = _fp
+                        if _fp is not None:
+                            fresh_prob = _fp
+                    re_db.store_ml_prob_at_fill(sig["id"], fresh_prob, fresh_htf)
+            except Exception as _refresh_exc:
+                _log.warning(
+                    "[RE-Engine] fill-time re-evaluation failed for %s, falling back to "
+                    "creation-time ml_prob: %s", sig.get("signal_ref"), _refresh_exc,
+                )
+
+            from backend.src.services.reversal_engine import decision_snapshot
+            decision_snapshot.record_fill(_fill_context, _edge_feats, _fill_prediction)
+
+            # Minimum fill delay (reversal-engine/040). Signals reaching
+            # their entry within moments of creation lose money consistently;
+            # the mechanism is unknown, so this is off unless turned on.
+            _soon = _gov.fill_too_soon(sig.get("created_at"), _time.time(), rs)
+            if _soon:
+                re_db.update_live_exec(sig["id"], status="filled_too_soon")
+                _log.info("[RE-Engine] %s", _soon)
+                return
+
+            # ── The new gates, and the shadow log ────────────────────
+            #
+            # All three are EVALUATED before any of them returns, so the
+            # champion/challenger log below sees the same fact set the live
+            # decision did. Recording at each early return instead would
+            # record "would take" for a variant whose later gates were
+            # never run, which reads as an endorsement it never gave.
+            #
+            # The liquidity gate therefore sits here rather than beside the
+            # news blackout. It costs a blocked signal the fill-time
+            # re-evaluation it would previously have skipped -- a few bridge
+            # calls on a rare path, in exchange for a comparison that means
+            # something. It changes no decision.
+            _liq_reason = _caps.liquidity_blocks(_time.time(), rs,
+                                                 upcoming_events(rs))
+            _trigger_reason = await self._entry_trigger_blocks(sig, rs)
+            _meta_on, _meta_threshold = _caps.meta_label_gate(rs)
+            from backend.src.services.reversal_engine import meta_label
+            _meta_p = meta_label.score_signal(sig)
+
+            from backend.src.services.reversal_engine import shadow
+            shadow.record_all(str(sig.get("signal_ref") or ""), {
+                "ml_prob": fresh_prob,
+                "meta_prob": _meta_p,
+                "trigger_passed": _trigger_reason is None,
+                "liquidity_blocked": bool(_liq_reason),
+            })
+
+            if _liq_reason:
+                re_db.update_live_exec(sig["id"], status="skipped:liquidity")
+                _log.info("[RE-Engine] liquidity gate blocked live exec %s -- %s",
+                          sig.get("signal_ref"), _liq_reason)
+                return
+
+            # Confirmation at the level, not just arrival at it (section
+            # 4.2). A confirmation the app could not evaluate because its
+            # own feed failed is not evidence against the setup, so a
+            # bridge error passes -- exactly as the news gate does.
+            if _trigger_reason:
+                re_db.update_live_exec(sig["id"], status="skipped:no_trigger")
+                _log.info("[RE-Engine] entry trigger blocked live exec %s -- %s",
+                          sig.get("signal_ref"), _trigger_reason)
+                return
+
+            # Proven edge (reversal-engine/240), off by default. Unlike every
+            # gate above, no answer is a refusal: on, nothing trades until
+            # the edge model has shown out of sample that the trades it takes
+            # make money on the template's own exits.
+            if _caps.require_proven_edge(rs):
+                from backend.src.services.reversal_engine import edge_model
+                # This proof learns creation vectors. A healthy fill refresh
+                # remains mandatory, but it must not substitute a different
+                # stage's observations into that trained model.
+                _creation_feats = re_ml.stored_vector(sig) if _edge_feats is not None else None
+                if _edge_feats is not None and not sig.get("ml_features_json"):
+                    _creation_feats = _edge_feats  # legacy signals without a recorded vector
+                _edge_ok, _edge_why, _ = edge_model.decide(_creation_feats)
+                if not _edge_ok:
+                    re_db.update_live_exec(sig["id"], status="skipped:unproven_edge")
+                    _log.info("[RE-Engine] proven-edge gate blocked live exec %s -- %s",
+                              sig.get("signal_ref"), _edge_why)
+                    return
+
+            # The meta-labeller (section 5.2): act or do not act, as a
+            # question of its own. None -- no opinion -- until it has costed
+            # trades to learn from, and no opinion never blocks.
+            if _meta_on and _meta_p is not None and _meta_p < _meta_threshold:
+                re_db.update_live_exec(sig["id"], status="meta_skipped")
+                _log.info("[RE-Engine] meta-label gate blocked live exec "
+                          "%s (p=%.3f < %.2f)", sig.get("signal_ref"),
+                          _meta_p, _meta_threshold)
+                return
+
+            # ML gate: block live execution when predicted R-multiple < 0 (expected loss)
+            if fresh_prob is not None and float(fresh_prob) < _ML_BLOCK_THRESHOLD:
+                re_db.update_live_exec(sig["id"], status="ml_skipped")
+                _log.info("[RE-Engine] ML gate blocked live exec (predicted_R=%.3f)", float(fresh_prob))
+                return
+
+            if self._main_eng is None:
+                return
+
+            # Persist to vantage_signals first -- open_trade_from_signal looks up
+            # the signal by signal_id, it does not accept a Signal object.
+            # Strategy is resolved automatically downstream via the channel
+            # override lookup for source_name="Reversal Engine" (see
+            # _active_strategy, which mirrors the same lookup).
+            main_sig = self._main_eng.create_signal(
+                source_name = "Reversal Engine",
+                direction   = sig["direction"],
+                entry_low   = sig["entry_low"],
+                entry_high  = sig["entry_high"],
+                stop_loss   = sig["stop_loss"],
+                tp1         = sig.get("tp1"),
+                tp2         = sig.get("tp2"),
+                tp3         = sig.get("tp3"),
+                tp4         = sig.get("tp4"),
+                tp5         = sig.get("tp5"),
+                tp6         = sig.get("tp6"),
+                tp7         = sig.get("tp7"),
+                tp8         = sig.get("tp8"),
+                notes       = f"RE {sig.get('signal_ref', '')} level={sig.get('level_type', '')}",
+            )
+            vantage_sig_id = main_sig["signal_id"]
+
+            # LIMIT ORDER toggle (Reversal Engine page, "Active Positions"
+            # card, 2026-07-23) -- routes via a genuine EA pending order
+            # instead of the market-fill flow below. Unlike Limit Runner/ORB
+            # (built with no fallback, since those are opt-in new features),
+            # this toggle is meant as a drop-in swap for existing behavior:
+            # if the EA isn't reachable, falls through to the normal
+            # open_trade_from_signal() market-fill path below rather than
+            # skipping the signal outright -- "acts as it does now" is the
+            # explicit off-state and the honest degraded-on-state both.
+            if rs.get("re_use_limit_order", 0):
+                _placed = await self._try_re_limit_order(sig, vantage_sig_id, tick)
+                if _placed is not None:
+                    return
+
+            trade = await self._main_eng.open_trade_from_signal(vantage_sig_id, tick=tick)
+            if trade:
+                _lt.mark(_lt_key, "e3_ordered")
+            if trade:
+                re_db.update_live_exec(
+                    sig["id"],
+                    mt5_ticket=trade.get("mt5_ticket"),
+                    vantage_sig_id=vantage_sig_id,
+                    status="executed",
+                )
+                _log.info("[RE-Engine] live trade opened mt5=%s", trade.get("mt5_ticket", "?"))
+            else:
+                re_db.update_live_exec(sig["id"], status="open_failed")
+        except Exception as exc:
+            _log.warning("[RE-Engine] live exec error: %s", exc)
+            try:
+                re_db.update_live_exec(sig["id"], status=f"error:{exc}")
+            except Exception:
+                pass
+
+    async def _entry_trigger_blocks(self, sig: dict, rs: dict) -> Optional[str]:
+        """A reason the level is not confirmed, or None.
+
+        None on every failure path, and deliberately: a check that could not
+        run is not a check that failed, and turning a bridge hiccup into a
+        silent trading halt would be a worse bug than the one this gate
+        exists to fix.
+        """
+        cfg = _caps.entry_trigger_config(rs)
+        if cfg is None:
+            return None
+        from backend.src.services.market import entry_contract
+        def observe(state, reason=None):
+            entry_contract.observe(re_db, "reversal", sig.get("signal_ref") or sig.get("id"),
+                "confirmation", {"confirmation_state": state, "reason": reason}, {}, source="Reversal Engine")
+        try:
+            from backend.src.services.market import entry_trigger as _et
+            candles = await self._bridge.get_candles("M1", 30)
+            level = float(sig.get("level_price") or 0.0)
+            atr = float(sig.get("atr") or 0.0)
+            if level <= 0:
+                observe("unknown", "level unavailable")
+                return None
+            result = _et.confirm((candles or [])[:-1], level,
+                                 str(sig.get("direction") or "BUY"), atr, cfg)
+            observe("confirmed" if result.passed else "refused", result.reason)
+            return None if result.passed else result.reason
+        except Exception as e:                    # noqa: BLE001
+            observe("unknown", str(e))
+            _log.debug("[RE-Engine] entry trigger could not be evaluated: %s", e)
+            return None
+
+    async def _maybe_stage_grid_template(self, sig_id: int, tick, price: float) -> bool:
+        """Dispatch a just-created signal immediately when the Reversal Engine
+        is assigned a grid EA template, instead of leaving it pending until
+        _check_outcomes sees price enter the zone.
+
+        A grid template's legs are real resting broker orders placed across
+        the signal's own zone, so the zone wait belongs to MT5, not to a 5s
+        Python poll. Waiting first (up to _SIGNAL_MAX_AGE_S, 2h) meant the
+        legs only ever went on the book once price had already arrived --
+        the resting order's entire latency advantage, spent.
+
+        The signal row deliberately stays 'pending' here: it is still
+        _check_outcomes' job to mark it triggered when price actually reaches
+        the zone, so this engine's own outcome/correlation accounting is
+        unchanged. What stops it double-firing is vantage_signal_id, which
+        this path writes via _try_live_execute -- see the guard at that call
+        site. Returns whether live execution was attempted.
+        """
+        from backend.src.services.positions.core_grid_template_dispatch import grid_template_for_source
+        tpl = grid_template_for_source("Reversal Engine")
+        if tpl is None:
+            return False
+        try:
+            from backend.src.db import database as core_db
+            if not core_db.get_risk_settings().get("re_live_execution", 0):
+                # Virtual mode: nothing to place, and _try_live_execute would
+                # only write skipped:live_disabled a cycle early.
+                return False
+        except Exception:
+            return False
+
+        sig = re_db.get_signal_by_id(sig_id)
+        if not sig:
+            return False
+        if sig.get("vantage_signal_id"):
+            return False
+
+        _log.info(
+            "[RE-Engine] grid template '%s' -- staging broker legs at signal "
+            "creation for %s (zone %.2f-%.2f, price %.2f)",
+            tpl.get("name", "?"), sig.get("signal_ref"),
+            float(sig.get("entry_low") or 0), float(sig.get("entry_high") or 0), price,
+        )
+        await self._try_live_execute(sig, price, tick)
+        return True
+
+    async def _try_re_limit_order(self, sig: dict, vantage_sig_id: str, tick) -> Optional[bool]:
+        """Places a genuine EA pending limit order for a Reversal Engine signal
+        instead of the market-fill flow. Returns True once handled
+        (whatever the outcome -- placed, rejected, or a duplicate-claim
+        no-op), or None if the EA isn't reachable at all, telling the
+        caller to fall back to the normal market-fill path.
+
+        Strategy/lot-size/SL are resolved the exact same way
+        open_trade_from_signal() resolves them (same channel-override
+        lookup, same session/schedule/circuit-breaker gates) via
+        resolve_open_trade_params -- this function only diverges at the
+        final "how is the order actually placed" step. Ladder pcts/be_at_pos/
+        trail_mode are looked up from core_open_trade's own tables so an
+        EA-managed fill of the resolved strategy behaves identically whether
+        it arrived via a market fill or a pending-order fill; a non-ladder
+        strategy (e.g. Conservative) gets harmless placeholder values since
+        its own EA management branch (ManageConservativeLike, etc.) never
+        reads t.pcts/t.beAtPos at all.
+        """
+        # Grid template: hand back to the market-fill path, which for a
+        # template is not a market fill at all -- it stages the template's own
+        # resting BuyLimit/SellLimit legs across the zone (core_open_trade.py's
+        # zone_low/zone_high handoff -> HandleOpenTemplateGrid). This function
+        # cannot serve one: place_pending_order() carries no template payload,
+        # and the EA hard-sets isTemplate=false on that path
+        # (HandlePlacePendingOrder), so with the LIMIT ORDER toggle on, a
+        # grid-template-assigned Reversal Engine placed a SINGLE plain limit
+        # with strategy="template:<name>" -- a strategy no EA manager handles
+        # -- losing the grid and every template management rule at once.
+        from backend.src.services.positions.core_grid_template_dispatch import grid_template_for_source
+        if grid_template_for_source("Reversal Engine") is not None:
+            _log.info(
+                "[RE-Engine] LIMIT ORDER toggle not applied to %s -- a grid template "
+                "stages its own resting legs", sig.get("signal_ref"),
+            )
+            return None
+
+        # A trading pause stops every automated entry, and this route places a
+        # resting order without passing through open_trade, where the pause is
+        # enforced (owner, 2026-10-05). Handled, not handed back: returning
+        # None would send the signal down the market path, which has its own
+        # refusal and a different failure handling.
+        if await db_module.to_db_thread(_gov.is_trading_paused):
+            re_db.update_live_exec(sig["id"], status="limit_order_skip:trading paused")
+            return True
+
+        from backend.src.services.broker import ea_bridge as _ea_mod
+        _ea = _ea_mod.get_instance()
+        if _ea is None or not _ea.is_ea_healthy():
+            return None
+
+        from backend.src.services.trading.open_trade import (
+            _EA_LADDER_PCTS, _EA_LADDER_BE_AT_POS, _EA_LADDER_TRAIL_MODE,
+        )
+        from backend.src.services.signals.resolution import resolve_open_trade_params
+
+        try:
+            resolved = await resolve_open_trade_params(self._bridge, vantage_sig_id, tick=tick)
+        except Exception as exc:
+            _log.info("[RE-Engine] limit-order resolve failed (%s) -- gate/claim skip", exc)
+            re_db.update_live_exec(sig["id"], status=f"limit_order_skip:{exc}")
+            return True
+
+        strategy  = resolved["strategy"]
+        lot_size  = resolved["lot_size"]
+        stop_loss = resolved["stop_loss_to_use"]
+        sig_row   = resolved["sig"]
+        direction = sig_row["direction"].upper()
+        entry_low  = float(sig_row["entry_low"])
+        entry_high = float(sig_row["entry_high"])
+        # Near edge of the signal's own entry zone -- same convention every
+        # other genuine-pending-order caller uses (Limit Runner, ORB/IVB).
+        price = entry_high if direction == "BUY" else entry_low
+
+        tps = {n: float(sig_row[f"tp{n}"]) for n in range(1, 9) if sig_row.get(f"tp{n}") is not None}
+
+        # A single-mode EA Template runs on the template's own rules here too
+        # (2026-09-28, live ticket 2103677613). This order went out with the
+        # RE signal's 8-level ladder -- four TPs below a BUY's fill -- a
+        # 103-pip stop against the template's 50, and no template on the
+        # wire, so the EA ran none of its partials, breakeven or trail. Same
+        # treatment as the Limit Runner path (limit-orders/020): stop and
+        # ladder measured from the RESTING price, where a limit fills, and
+        # the lot sized from that stop. Grid templates never get here (see
+        # the hand-back above).
+        _template = None
+        from backend.src.services.broker import ea_templates as _et
+        if _et.is_template_override(strategy):
+            _template = _et.get_ea_template(_et.template_name_from_override(strategy))
+        if _template is not None:
+            from backend.src.services.trading import template_levels as _tl
+            from backend.src.services.trading.open_trade import resolve_template_tps
+            from backend.src.services.trading.close_trade import get_trading_balance
+            from backend.src.services.trading.fees_sizing import suggest_lot_size
+            _tpl_atr = await _tl.template_atr(_template, self._bridge)   # handover 031
+            _tpl_tps, _, _ = resolve_template_tps(
+                _template, direction, _tl.PriceRef(price),
+                [tps.get(n) for n in range(1, 9)], "Reversal Engine", atr=_tpl_atr)
+            if _tpl_tps:
+                tps = {int(k): float(v) for k, v in _tpl_tps.items()}
+            _tpl_sl = _tl.template_sl_at(_template, direction, price, atr=_tpl_atr)
+            if _tpl_sl is not None:
+                stop_loss = _tpl_sl
+            # Same default resolve_open_trade_params used for this signal.
+            _rs = await db_module.to_db_thread(db_module.get_risk_settings)
+            _balance = await get_trading_balance(self._bridge, 1000.0)
+            _sized = lot_sizing.template_lot(
+                _rs, _template, price, stop_loss, _balance, suggest_lot_size)
+            # Untouched unless vol_target_sizing_enabled is on (docs/todo/016).
+            lot_size = await vol_target.scale_lot(
+                _sized.lot, _rs, source="Reversal Engine", fixed=_sized.fixed)
+            try:
+                lot_sizing.refuse_unplaceable(lot_size, _rs)
+            except lot_sizing.UnplaceableLot as exc:
+                re_db.update_live_exec(sig["id"], status=f"limit_order_skip:{exc}")
+                return True
+
+        if strategy in _EA_LADDER_PCTS and tps:
+            _table = _EA_LADDER_PCTS[strategy]
+            pcts = _table.get(len(tps), _table[max(_table)])
+            be_at_pos = _EA_LADDER_BE_AT_POS[strategy]
+            trail_mode = _EA_LADDER_TRAIL_MODE.get(strategy)
+        else:
+            pcts, be_at_pos, trail_mode = [1.0], 0, None
+
+        # Atomic claim -- same pattern core_open_trade_from_signal.
+        # open_trade_from_signal uses, so a signal can't be opened twice by
+        # two concurrent callers (this path and the market-fill path both
+        # read the same 'pending'/'active' signal row before either writes).
+        claimed = re_db.claim_vantage_signal_activation(vantage_sig_id)
+        if not claimed:
+            return True
+
+        trade_id = str(uuid.uuid4())[:16]
+        try:
+            # 60min, not the old 240 -- this resting order has no fill-time
+            # re-check at all (MT5 fills it directly, no round-trip back to
+            # Python), so it shouldn't get the same TTL as a signal that DOES
+            # get re-validated at fire time. See core_limit_order_signal.py's
+            # _DEFAULT_EXPIRE_MINUTES for the full reasoning (matched here).
+            ack = await _ea.place_pending_order(
+                trade_id, direction, price, lot_size, stop_loss, tps, pcts, be_at_pos, strategy,
+                expire_minutes=60.0, close_full_on_last=True, trail_mode=trail_mode,
+                template=_template,
+            )
+        except Exception as exc:
+            re_db.restore_vantage_signal_pending(vantage_sig_id)
+            _log.warning("[RE-Engine] place_pending_order failed: %s", exc)
+            re_db.update_live_exec(sig["id"], status=f"limit_order_error:{exc}")
+            return True
+
+        if ack.get("type") != "pending_order_placed":
+            re_db.restore_vantage_signal_pending(vantage_sig_id)
+            _err = ack.get("error", "unknown error")
+            _log.warning("[RE-Engine] EA rejected pending order: %s", _err)
+            re_db.update_live_exec(sig["id"], status=f"limit_order_rejected:{_err}")
+            return True
+
+        ticket = ack.get("ticket")
+        now = time.time()
+        re_db.insert_vantage_pending_order(
+            (trade_id, vantage_sig_id, None, "Reversal Engine", direction, price, stop_loss,
+             json.dumps(tps), json.dumps(pcts), be_at_pos, 0, lot_size, ticket,
+             "working", now, strategy))
+        re_db.update_live_exec(sig["id"], vantage_sig_id=vantage_sig_id, status=f"limit_order_placed:{ticket}")
+        _log.info("[RE-Engine] pending %s ticket=%s @ %.2f strategy=%s", direction, ticket, price, strategy)
+        return True

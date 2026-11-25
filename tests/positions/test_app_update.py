@@ -1,0 +1,508 @@
+"""GitHub-based app self-update.
+
+`core_app_update.py` was 60% covered, with the two functions that matter most
+almost entirely untested: `check_for_update` (the header's "Update Available"
+badge and the Update page) and `apply_update` (the button both the client and
+the admin console converge on).
+
+**No git command runs.** `_run_git` is replaced with a scripted recorder, so the
+tests drive the decision logic without fetching, checking out, or touching this
+working tree. `apply_update` force-checkouts over local changes by design; a
+test that really invoked it would discard whatever was in progress.
+
+The behaviour worth pinning is the failure handling. Both functions return an
+error dict instead of raising -- `check_for_update` because the page calls it on
+a timer and "a flaky connection never breaks the page", `apply_update` because
+its caller shows the result and decides whether to restart. Silent success on a
+failed pull is the bad outcome: the user restarts into the old code believing it
+updated.
+"""
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+
+from backend.src.services.positions import core_app_update as upd
+
+
+class _Git:
+    """A scripted `git`. Each entry is (returncode, stdout, stderr), matched to
+    calls in order; the call log is the assertion surface."""
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.calls = []
+
+    async def __call__(self, *args, timeout=30.0):
+        self.calls.append(args)
+        if not self.results:
+            return 0, "", ""
+        return self.results.pop(0)
+
+    @property
+    def commands(self):
+        return [a[0] for a in self.calls]
+
+
+@pytest.fixture
+def git(monkeypatch):
+    def _install(*results):
+        g = _Git(*results)
+        monkeypatch.setattr(upd, "_run_git", g)
+        return g
+    return _install
+
+
+@pytest.fixture
+def has_checkout(monkeypatch, tmp_path):
+    """Point the module at a directory that does or does not contain .git."""
+    def _set(exists: bool):
+        root = tmp_path / "repo"
+        (root / ".git").mkdir(parents=True) if exists else root.mkdir(parents=True)
+        monkeypatch.setattr(upd, "_REPO_ROOT", root)
+        return root
+    return _set
+
+
+# ── check_for_update ──────────────────────────────────────────────────────────
+
+def test_no_checkout_offers_to_create_one_rather_than_just_failing(has_checkout, git, monkeypatch):
+    """Amended 2026-09-06. This used to return a bare "not a git checkout" and
+    the Update page turned that into "Check failed" with no button, so a
+    freshly installed machine could never reach the bootstrap `apply_update()`
+    has done since 2026-09-03 -- the only way out was an admin console push.
+    A machine that HAS git is one click away from updating; say so."""
+    has_checkout(False)
+    monkeypatch.setattr(upd.shutil, "which", lambda _: "/usr/bin/git")
+    g = git()
+    out = asyncio.run(upd.check_for_update())
+
+    assert out["available"] is False
+    assert out["bootstrap"] is True
+    assert g.calls == [], "nothing should be run without a checkout"
+
+
+def test_no_checkout_and_no_git_says_git_is_what_is_missing(has_checkout, git, monkeypatch):
+    """The distinction the user acts on: install git, versus press the button.
+    Offering a bootstrap that cannot run is worse than saying why."""
+    has_checkout(False)
+    monkeypatch.setattr(upd.shutil, "which", lambda _: None)
+    g = git()
+    out = asyncio.run(upd.check_for_update())
+
+    assert out["available"] is False
+    assert out["bootstrap"] is False
+    assert "git is not installed" in out["error"]
+    assert g.calls == []
+
+
+def test_a_failed_fetch_is_reported_not_raised(has_checkout, git):
+    """The Update page polls this on a timer; an exception would break it."""
+    has_checkout(True)
+    git((128, "", "fatal: unable to access remote"))
+
+    out = asyncio.run(upd.check_for_update())
+
+    assert out["available"] is False
+    assert "unable to access remote" in out["error"]
+
+
+def test_being_up_to_date_is_not_an_update(has_checkout, git):
+    has_checkout(True)
+    same = "a" * 40
+    git((0, "", ""), (0, same, ""), (0, same, ""))
+
+    out = asyncio.run(upd.check_for_update())
+
+    assert out["available"] is False
+    assert out["error"] is None
+    assert out["commits"] == []
+    assert out["local_sha"] == out["remote_sha"] == same
+
+
+def test_a_difference_is_reported_with_its_commits_newest_first(has_checkout, git):
+    has_checkout(True)
+    local, remote = "a" * 40, "b" * 40
+    log = "\x1f".join(["b" * 40, "bbbbbbb", "newest change"]) + "\n" + \
+          "\x1f".join(["c" * 40, "ccccccc", "older change"])
+    git((0, "", ""), (0, local, ""), (0, remote, ""), (0, log, ""))
+
+    out = asyncio.run(upd.check_for_update())
+
+    assert out["available"] is True
+    assert out["error"] is None
+    assert [c["summary"] for c in out["commits"]] == ["newest change", "older change"]
+    assert out["commits"][0]["short_sha"] == "bbbbbbb"
+
+
+def test_an_unreadable_log_still_reports_the_update(has_checkout, git):
+    """Knowing an update exists matters more than being able to list it."""
+    has_checkout(True)
+    git((0, "", ""), (0, "a" * 40, ""), (0, "b" * 40, ""), (1, "", "log failed"))
+
+    out = asyncio.run(upd.check_for_update())
+
+    assert out["available"] is True
+    assert out["commits"] == []
+
+
+class TestOnlyBeingBEHINDOriginIsAnUpdate:
+    """`available` was `local_sha != remote_sha`, which is also true when this
+    checkout is AHEAD of origin/main or has diverged from it.
+
+    Reported live 2026-09-04, and reproducible in the development checkout at
+    the time: one unpushed local commit made the header badge flash "Update
+    Available" permanently. `git log <local>..<remote>` is empty in that
+    direction, so the popup had no commits to list, no digest to summarise,
+    and said "The commit list for this update could not be read." The badge
+    was offering to replace the working tree with an OLDER commit.
+
+    The two empty-list cases are not the same fact and must not be collapsed:
+    a log that FAILED means we could not tell (assume an update, see below),
+    while a log that succeeded and returned nothing means the range really is
+    empty and there is nothing to pull.
+    """
+
+    def test_a_checkout_that_is_AHEAD_of_origin_has_no_update(self, has_checkout, git):
+        has_checkout(True)
+        # rc 0 with no output: the range local..remote is genuinely empty.
+        git((0, "", ""), (0, "a" * 40, ""), (0, "b" * 40, ""), (0, "", ""))
+
+        out = asyncio.run(upd.check_for_update())
+
+        assert out["available"] is False, (
+            "the badge flashes an update that does not exist, and offers to "
+            "check out an older commit")
+
+    def test_it_reports_no_error_for_it_either(self, has_checkout, git):
+        """Being ahead of origin is a normal state for the machine the app is
+        developed on -- not a failure to report on the Update page."""
+        has_checkout(True)
+        git((0, "", ""), (0, "a" * 40, ""), (0, "b" * 40, ""), (0, "", ""))
+
+        out = asyncio.run(upd.check_for_update())
+
+        assert out["error"] is None
+        assert out["commits"] == []
+
+    def test_the_shas_are_still_returned(self, has_checkout, git):
+        """The Update page shows them either way, and summarise_changes()
+        needs the pair to build its digest."""
+        has_checkout(True)
+        git((0, "", ""), (0, "a" * 40, ""), (0, "b" * 40, ""), (0, "", ""))
+
+        out = asyncio.run(upd.check_for_update())
+
+        assert out["local_sha"] == "a" * 40
+        assert out["remote_sha"] == "b" * 40
+
+    def test_a_REAL_update_is_still_offered(self, has_checkout, git):
+        """The control. A guard that answered False to everything would pass
+        every test above and silently stop the app updating for ever."""
+        has_checkout(True)
+        log = "\x1f".join(["b" * 40, "bbbbbbb", "a genuine new commit"])
+        git((0, "", ""), (0, "a" * 40, ""), (0, "b" * 40, ""), (0, log, ""))
+
+        out = asyncio.run(upd.check_for_update())
+
+        assert out["available"] is True
+
+    def test_the_badge_and_the_popup_can_never_disagree(self, has_checkout, git):
+        """The invariant behind the whole bug: if the badge is shown, the
+        popup has something to show -- either commits, or the honest "could
+        not read the range" case the test below covers."""
+        has_checkout(True)
+        git((0, "", ""), (0, "a" * 40, ""), (0, "b" * 40, ""), (0, "  \n ", ""))
+
+        out = asyncio.run(upd.check_for_update())
+
+        assert not (out["available"] and not out["commits"]), (
+            "an update was announced with nothing to show for it")
+
+
+def test_a_malformed_log_line_is_skipped_not_guessed_at(has_checkout, git):
+    has_checkout(True)
+    log = "not-in-the-expected-format\n" + "\x1f".join(["b" * 40, "bbbbbbb", "good one"])
+    git((0, "", ""), (0, "a" * 40, ""), (0, "b" * 40, ""), (0, log, ""))
+
+    out = asyncio.run(upd.check_for_update())
+
+    assert [c["summary"] for c in out["commits"]] == ["good one"]
+
+
+def test_an_unresolvable_head_is_reported(has_checkout, git):
+    has_checkout(True)
+    git((0, "", ""), (128, "", "bad object"))
+
+    out = asyncio.run(upd.check_for_update())
+    assert out["error"] == "could not resolve local HEAD"
+
+
+# ── apply_update ──────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def no_post_steps(monkeypatch):
+    """pip install and the pycache sweep are real filesystem work; the decision
+    logic under test is the git sequence before them."""
+    async def _to_thread(fn, *a, **k):
+        return None
+    monkeypatch.setattr(upd.asyncio, "to_thread", _to_thread)
+
+
+def test_a_fresh_install_is_bootstrapped_before_fetching(has_checkout, git, no_post_steps, monkeypatch, restart):
+    """The Setup & Start scripts copy files, they never clone -- so a newly
+    installed machine has no .git until its first update."""
+    has_checkout(False)
+    monkeypatch.setattr(upd.shutil, "which", lambda _: "/usr/bin/git")
+    g = git()
+
+    out = asyncio.run(upd.apply_update())
+
+    assert out == {"ok": True, "error": None}
+    assert g.commands[:2] == ["init", "remote"], "a checkout must be created first"
+    assert "fetch" in g.commands and "checkout" in g.commands
+
+
+def test_no_git_on_path_cannot_bootstrap(has_checkout, git, no_post_steps, monkeypatch):
+    has_checkout(False)
+    monkeypatch.setattr(upd.shutil, "which", lambda _: None)
+    g = git()
+
+    out = asyncio.run(upd.apply_update())
+
+    assert out["ok"] is False
+    assert "git not found" in out["error"]
+    assert g.calls == []
+
+
+def test_an_existing_checkout_is_not_re_initialised(has_checkout, git, no_post_steps, restart):
+    has_checkout(True)
+    g = git()
+
+    asyncio.run(upd.apply_update())
+
+    assert "init" not in g.commands
+
+
+def test_the_working_tree_is_forced_to_match_origin(has_checkout, git, no_post_steps, restart):
+    """`checkout -B --track -f`, not `pull --ff-only`. No client carries its own
+    commits; each mirrors origin, so discarding local drift is the intended
+    outcome rather than data loss."""
+    has_checkout(True)
+    g = git()
+
+    asyncio.run(upd.apply_update())
+
+    checkout = next(a for a in g.calls if a[0] == "checkout")
+    assert "-B" in checkout and "--track" in checkout and "-f" in checkout
+
+
+def test_a_failed_fetch_stops_before_touching_the_working_tree(has_checkout, git, no_post_steps):
+    has_checkout(True)
+    g = git((128, "", "network down"))
+
+    out = asyncio.run(upd.apply_update())
+
+    assert out["ok"] is False
+    assert "network down" in out["error"]
+    assert "checkout" not in g.commands, "a failed fetch must not proceed to checkout"
+
+
+def test_a_failed_checkout_is_reported_as_a_failure(has_checkout, git, no_post_steps):
+    has_checkout(True)
+    git((0, "", ""), (1, "", "checkout refused"))
+
+    out = asyncio.run(upd.apply_update())
+
+    assert out["ok"] is False
+    assert "checkout refused" in out["error"]
+
+
+def test_a_post_update_step_failing_is_a_warning_not_a_failure(has_checkout, git, monkeypatch, restart):
+    """The pull already succeeded. Reporting failure would invite a blind retry
+    of something that is not safe to repeat, when the real fix is another Save
+    & Restart."""
+    has_checkout(True)
+    git()
+
+    async def _boom(fn, *a, **k):
+        raise RuntimeError("pip exploded")
+    monkeypatch.setattr(upd.asyncio, "to_thread", _boom)
+
+    out = asyncio.run(upd.apply_update())
+
+    assert out["ok"] is True, "the code did land, so this is not a failed update"
+    assert "post-update step failed" in out["error"]
+    assert "pip exploded" in out["error"]
+
+
+# ── apply_update restarts on success ────────────────────────────────────────
+# 2026-09-03: a live install was left running for ~40 minutes against a venv
+# apply_update() had already reinstalled dependencies into, because every
+# caller was individually responsible for restarting afterward and the
+# instrumentation to know one of them hadn't (or had failed before reaching
+# that step) didn't exist -- every outbound HTTPS call (Telegram alerts, AI
+# commentary, the daily email) failed with a stale-module FileNotFoundError
+# for that whole window while 5 real trades opened with zero notification.
+# apply_update() now restarts itself so no caller can skip or fumble it.
+
+@pytest.fixture
+def restart(monkeypatch):
+    """Stub the actual relaunch — a real one spawns a subprocess and asks a
+    (nonexistent, in a test) NiceGUI server to shut down.
+
+    EVERY test that reaches the end of apply_update() needs this, including
+    the ones asserting only on the git sequence: the restart is the last
+    thing apply_update does on both its success and its soft-failure path.
+    Four tests did not take it and spawned a real relaunch of a tmp_path that
+    has no run.py in it. On macOS that is invisible (a detached shell that
+    fails silently), which is why it survived; on Windows CI it is a hard
+    PermissionError [WinError 5], because os_utils.restart_app passes
+    CREATE_BREAKAWAY_FROM_JOB and the GitHub runner puts the job in a Job
+    Object that does not permit breakaway. Four red tests on main,
+    2026-09-04."""
+    calls = []
+    monkeypatch.setattr(upd, "_restart", lambda: calls.append(True))
+    return calls
+
+
+def test_a_successful_update_restarts_the_app(has_checkout, git, no_post_steps, restart):
+    has_checkout(True)
+    git()
+
+    out = asyncio.run(upd.apply_update())
+
+    assert out == {"ok": True, "error": None}
+    assert restart == [True], "a landed update must not be left running the old code"
+
+
+def test_a_soft_post_update_failure_still_restarts(has_checkout, git, monkeypatch, restart):
+    """The checkout landed even though pip/pycache-clear didn't -- restarting
+    is exactly what 'Save & Restart again' meant, so do it automatically
+    rather than leaving the caller to notice and click it."""
+    has_checkout(True)
+    git()
+
+    async def _boom(fn, *a, **k):
+        raise RuntimeError("pip exploded")
+    monkeypatch.setattr(upd.asyncio, "to_thread", _boom)
+
+    out = asyncio.run(upd.apply_update())
+
+    assert out["ok"] is True
+    assert restart == [True]
+
+
+def test_a_failed_fetch_does_not_restart(has_checkout, git, no_post_steps, restart):
+    has_checkout(True)
+    git((128, "", "network down"))
+
+    out = asyncio.run(upd.apply_update())
+
+    assert out["ok"] is False
+    assert restart == [], "nothing landed -- restarting would just relaunch the old code"
+
+
+def test_a_failed_checkout_does_not_restart(has_checkout, git, no_post_steps, restart):
+    has_checkout(True)
+    git((0, "", ""), (1, "", "checkout refused"))
+
+    out = asyncio.run(upd.apply_update())
+
+    assert out["ok"] is False
+    assert restart == []
+
+
+def test_restart_can_be_suppressed_by_the_caller(has_checkout, git, no_post_steps, restart):
+    """The admin-console-triggered update (cluster/remote/_update.py) runs its
+    own restart sequence afterward -- Windows icon refresh, then a hard
+    os._exit() with the bat-loop's exit code -- and must keep doing exactly
+    that rather than being pre-empted by this one."""
+    has_checkout(True)
+    git()
+
+    out = asyncio.run(upd.apply_update(restart=False))
+
+    assert out == {"ok": True, "error": None}
+    assert restart == []
+
+
+def test_repo_root_resolves_to_the_actual_checkout_root():
+    """_REPO_ROOT is computed once at import time from this module's own
+    location. The `has_checkout` fixture monkeypatches it directly in every
+    other test, which hides a wrong parent-count -- this test is the one
+    place that would catch this module resolving to the wrong directory
+    after being moved, the way os_utils.repo_root()'s docstring describes
+    happening to four other modules on 2026-08-25."""
+    from backend.src.utils import os_utils
+
+    assert upd._REPO_ROOT == os_utils.repo_root()
+    assert (upd._REPO_ROOT / "run.py").exists()
+
+
+class TestTheBootstrapPointsAtTHISRepo:
+    """`_GITHUB_REPO_URL` is the remote a machine with no `.git` is wired to.
+
+    It named `MooreSi/forex` -- the NiceGUI repo -- in a checkout whose own
+    `origin` is `MooreSi/forex-gold`. The installers copy rather than clone,
+    so a downloaded folder has no `.git` and hits this constant twice:
+
+      * `link_checkout()` wires origin to it at every startup, finds no commit
+        whose tree matches a React folder, and deletes the `.git` it just made.
+        Harmless, but that machine can never self-update.
+      * Settings > Update then offers **Set Up Updates**, and `apply_update()`
+        does `remote add origin <this>` + `checkout -B main --track
+        origin/main -f`. Force-checking-out the OLD app over the new folder,
+        which is the failure this whole session started from: a Mac running
+        the React app that came up serving NiceGUI.
+
+    Owner's decision 2026-09-21: this checkout's own repo is canonical --
+    `forex-react` then, `forex-gold` since the 2026-09-22 rename.
+    `~/Forex-Update` keeps `MooreSi/forex` -- its own `origin` -- and this is
+    the second thing that must legitimately differ between the two checkouts,
+    after the version number. See rules/80.
+    """
+
+    EXPECTED = "https://github.com/MooreSi/forex-gold"
+
+    def test_the_bootstrap_url_is_this_repo(self):
+        assert upd._GITHUB_REPO_URL == self.EXPECTED
+
+    def test_it_is_not_the_nicegui_repo(self):
+        """"forex-gold" CONTAINS "forex", so a substring check passes on the
+        old value and proves nothing. The suffix is what separates them."""
+        assert not upd._GITHUB_REPO_URL.rstrip("/").endswith("/forex")
+
+    def test_the_composed_clone_url_is_well_formed(self):
+        """Both call sites build `f"{_GITHUB_REPO_URL}.git"`; a constant that
+        already ended in .git would produce forex-gold.git.git."""
+        composed = f"{upd._GITHUB_REPO_URL}.git"
+        assert composed.endswith("/forex-gold.git")
+        assert ".git.git" not in composed
+
+    def test_it_names_the_repo_this_checkout_actually_pulls_from(self):
+        """The constant and `origin` disagreeing is what the bug WAS, so the
+        two are compared rather than only pinned to a literal.
+
+        Compares the repository name, not the whole URL: a fork or an SSH
+        remote is a different URL for the same repo, and neither is wrong.
+        """
+        import subprocess
+
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(upd._REPO_ROOT), "remote", "get-url", "origin"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            pytest.skip(f"git unavailable: {exc}")
+        if out.returncode != 0:
+            pytest.skip("no origin remote here (a copied install, or an archive)")
+
+        origin_repo = out.stdout.strip().rstrip("/").removesuffix(".git").rsplit("/", 1)[-1]
+        constant_repo = upd._GITHUB_REPO_URL.rstrip("/").removesuffix(".git").rsplit("/", 1)[-1]
+
+        assert constant_repo == origin_repo, (
+            f"the bootstrap would wire a copied install to {constant_repo!r} "
+            f"while this checkout pulls from {origin_repo!r}")

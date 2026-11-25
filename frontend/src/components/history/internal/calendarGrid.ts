@@ -1,0 +1,271 @@
+import type { TradeRow } from "../hooks/useClosedTrades";
+
+/**
+ * Closed trades arranged as a month, the way the NiceGUI Calendar tab showed
+ * them.
+ *
+ * **Which day a trade belongs to is the whole problem.** A close stamp is
+ * broker time (UTC+3), so a trade that closed at 01:30 broker time on Tuesday
+ * closed at 22:30 London on Monday — and putting it on Tuesday moves a loss
+ * into the wrong week, wrong month and wrong weekly total. Everything here
+ * goes through one shift, in one place.
+ *
+ * Built from the rows the trade table already fetched rather than a read of
+ * its own: the calendar and the table must agree about what a day earned.
+ *
+ * **The day is the backend's `row.day`, on the trading clock** (owner,
+ * 2026-10-10: every day in the app is the Trading Clock's). The browser does
+ * not know the clock's offset, so it does not work it out; `tradingDate` is
+ * only the fallback for a row from a backend that predates the field, and
+ * files by the UTC date as this screen always did.
+ */
+const MT5_UTC_OFFSET_SECONDS = 3 * 60 * 60;
+
+export interface DayCell {
+  /** ISO date, YYYY-MM-DD, on the trading clock. */
+  date: string;
+  day: number;
+  pnl: number;
+  trades: TradeRow[];
+  /** False for the leading and trailing cells that pad the grid. */
+  inMonth: boolean;
+}
+
+export interface WeekRow {
+  days: DayCell[];
+  pnl: number;
+  trades: number;
+}
+
+export interface MonthGrid {
+  year: number;
+  /** 1-12. */
+  month: number;
+  weeks: WeekRow[];
+  pnl: number;
+  trades: number;
+}
+
+/** The ISO UTC date a close stamp belongs to. Fallback only: see `rowDay`. */
+export function tradingDate(closeTs: number): string {
+  const d = new Date((closeTs - MT5_UTC_OFFSET_SECONDS) * 1000);
+  // UTC getters after the shift: a local-time getter would apply the viewer's
+  // own timezone on top and move the boundary again, differently per machine.
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/** The day a closed trade is filed under: the backend's, else the fallback. */
+export function rowDay(row: TradeRow): string {
+  return row.day || tradingDate(row.close_ts);
+}
+
+export function groupByDay(rows: TradeRow[]): Map<string, TradeRow[]> {
+  const out = new Map<string, TradeRow[]>();
+  for (const row of rows ?? []) {
+    if (!row?.close_ts) continue;
+    const key = rowDay(row);
+    const bucket = out.get(key);
+    if (bucket) bucket.push(row);
+    else out.set(key, [row]);
+  }
+  return out;
+}
+
+/**
+ * Each traded day's gain, as a percent of the balance that day OPENED on.
+ *
+ * The opening balance is the balance now minus everything realised from that
+ * day on: the rule `risk/daily_goal.py` uses for today, walked back a day at
+ * a time, so the calendar's 1% and the daily goal's 1% are the same 1%.
+ * Deposits and withdrawals are not in the closed-trade rows, so a day before
+ * one is measured against a balance the account did not have. No balance
+ * gives no percentages at all, and a day whose opening balance comes out at
+ * or below zero is left out: a percentage of nothing is not a figure.
+ */
+export function dayGains(rows: TradeRow[], balance: number | null): Map<string, number> {
+  const out = new Map<string, number>();
+  const byDay = groupByDay(rows);
+  for (const [day, open] of dayOpenBalances(rows, balance)) {
+    const pnl = byDay.get(day)!.reduce((s, t) => s + (Number(t.pnl) || 0), 0);
+    if (open > 0) out.set(day, (pnl / open) * 100);
+  }
+  return out;
+}
+
+/** Each traded day's opening balance, by the rule `dayGains` describes.
+ *  Empty without a balance. Values may be at or below zero (see `dayGains`);
+ *  every reader must check. */
+export function dayOpenBalances(rows: TradeRow[], balance: number | null): Map<string, number> {
+  const out = new Map<string, number>();
+  if (balance == null || !Number.isFinite(balance)) return out;
+  const byDay = groupByDay(rows);
+  let after = 0;  // realised on the days later than the one being measured
+  for (const day of [...byDay.keys()].sort().reverse()) {
+    const pnl = byDay.get(day)!.reduce((s, t) => s + (Number(t.pnl) || 0), 0);
+    out.set(day, balance - after - pnl);
+    after += pnl;
+  }
+  return out;
+}
+
+/**
+ * A run of days' gain (a week, a month), as a percent of the balance the run
+ * OPENED on: its realised P&L over `balance - everything realised from
+ * `from` on`. Not the sum of the days' percentages, which are each of a
+ * different balance. `from` and `to` are ISO dates, inclusive. Null with no
+ * balance, no trades in the run, or an opening balance at or below zero; the
+ * same deposit caveat as `dayGains` applies.
+ */
+export function periodGain(
+  rows: TradeRow[], balance: number | null, from: string, to: string,
+): number | null {
+  if (balance == null || !Number.isFinite(balance)) return null;
+  let pnl = 0;
+  let after = 0;
+  let n = 0;
+  for (const [day, trades] of groupByDay(rows)) {
+    const sum = trades.reduce((s, t) => s + (Number(t.pnl) || 0), 0);
+    if (day > to) after += sum;
+    else if (day >= from) { pnl += sum; n += trades.length; }
+  }
+  const open = balance - after - pnl;
+  return n > 0 && open > 0 ? (pnl / open) * 100 : null;
+}
+
+/** "+1.25%" / "-0.40%": a day's gain, signed, to two places. */
+export function formatGain(pct: number): string {
+  return `${pct > 0 ? "+" : ""}${pct.toFixed(2)}%`;
+}
+
+function iso(year: number, month: number, day: number): string {
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+/**
+ * A Monday-first month grid, padded to whole weeks.
+ *
+ * Monday-first because the trading week is, and because a Sunday-first grid
+ * splits the weekend across two rows — which puts Friday's close and the
+ * Sunday open in different weekly totals.
+ */
+export function monthGrid(rows: TradeRow[], year: number, month: number): MonthGrid {
+  const byDay = groupByDay(rows);
+  const first = new Date(Date.UTC(year, month - 1, 1));
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+
+  // getUTCDay is 0=Sunday. Monday-first means Monday is 0.
+  const lead = (first.getUTCDay() + 6) % 7;
+
+  const cells: DayCell[] = [];
+  const push = (y: number, m: number, d: number, inMonth: boolean) => {
+    const date = iso(y, m, d);
+    const trades = byDay.get(date) ?? [];
+    cells.push({
+      date, day: d, inMonth, trades,
+      pnl: trades.reduce((sum, t) => sum + (Number(t.pnl) || 0), 0),
+    });
+  };
+
+  // Leading pad from the previous month, so the first row is a real week.
+  const prevMonth = month === 1 ? 12 : month - 1;
+  const prevYear = month === 1 ? year - 1 : year;
+  const prevDays = new Date(Date.UTC(prevYear, prevMonth, 0)).getUTCDate();
+  for (let i = lead; i > 0; i--) push(prevYear, prevMonth, prevDays - i + 1, false);
+
+  for (let d = 1; d <= daysInMonth; d++) push(year, month, d, true);
+
+  const nextMonth = month === 12 ? 1 : month + 1;
+  const nextYear = month === 12 ? year + 1 : year;
+  let trail = 1;
+  while (cells.length % 7 !== 0) push(nextYear, nextMonth, trail++, false);
+
+  const weeks: WeekRow[] = [];
+  for (let i = 0; i < cells.length; i += 7) {
+    const days = cells.slice(i, i + 7);
+    weeks.push({
+      days,
+      // Weekly totals count only this month's days: a total that included the
+      // padding would double-count the same trades in two months.
+      pnl: days.reduce((s, c) => s + (c.inMonth ? c.pnl : 0), 0),
+      trades: days.reduce((s, c) => s + (c.inMonth ? c.trades.length : 0), 0),
+    });
+  }
+
+  const own = cells.filter((c) => c.inMonth);
+  return {
+    year, month, weeks,
+    pnl: own.reduce((s, c) => s + c.pnl, 0),
+    trades: own.reduce((s, c) => s + c.trades.length, 0),
+  };
+}
+
+export interface Tally {
+  pnl: number;
+  /** Trades in this bucket. */
+  n: number;
+  /** Winners among them. Shown as "3 / 5": on a two-trade day a bare "50%"
+   *  says almost nothing, and this panel is most useful on those days. */
+  wins: number;
+}
+
+function tally(
+  trades: TradeRow[],
+  keyOf: (t: TradeRow) => string | null,
+): (Tally & { key: string })[] {
+  const acc = new Map<string, { pnl: number; n: number; wins: number }>();
+  for (const t of trades ?? []) {
+    const key = keyOf(t);
+    if (key === null) continue;
+    const cur = acc.get(key) ?? { pnl: 0, n: 0, wins: 0 };
+    const pnl = Number(t.pnl) || 0;
+    cur.pnl += pnl;
+    cur.n += 1;
+    if (pnl > 0) cur.wins += 1;
+    acc.set(key, cur);
+  }
+  return [...acc.entries()].map(([key, v]) => ({ key, ...v }));
+}
+
+/** Per-source totals for one day, worst first. */
+export function bySource(trades: TradeRow[]): (Tally & { source: string })[] {
+  return tally(trades, (t) => t.source || "unattributed")
+    .map(({ key, ...v }) => ({ source: key, ...v }))
+    .sort((a, b) => a.pnl - b.pnl);
+}
+
+/**
+ * The trading sessions, in the order a day runs through them.
+ *
+ * The same five the backend's `_session_for_hour` names and the hourly heat
+ * map reads. Chronological rather than sorted by P&L: this table is read as a
+ * day, and "the Asian session gave it all back" is a sentence about order.
+ */
+export const SESSIONS: readonly { key: string; label: string }[] = [
+  { key: "asian", label: "Asian" },
+  { key: "london", label: "London" },
+  { key: "overlap", label: "Overlap (LDN+NY)" },
+  { key: "ny", label: "New York" },
+  // 21:00-24:00 UTC, no session since bugs/057 (it used to count as Asian).
+  { key: "off", label: "Out of session" },
+];
+
+export interface SessionSplit {
+  rows: (Tally & { key: string; label: string })[];
+  /** Trades with no session on them — no close stamp in the broker's record.
+   *  Counted, never bucketed: a wrong session reads as a real result. */
+  unplaced: number;
+}
+
+/** Per-session totals for one day, in session order. */
+export function bySession(trades: TradeRow[]): SessionSplit {
+  const found = new Map(tally(trades, (t) => t.session || null).map((r) => [r.key, r]));
+  const rows = SESSIONS
+    .filter((s) => found.has(s.key))
+    .map((s) => ({ ...(found.get(s.key) as Tally & { key: string }),
+                   label: s.label }));
+  const placed = rows.reduce((sum, r) => sum + r.n, 0);
+  return { rows, unplaced: (trades ?? []).length - placed };
+}

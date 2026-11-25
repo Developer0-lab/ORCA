@@ -1,0 +1,35 @@
+# The dashboard's own server. These arrived transitively through NiceGUI until
+# 2026-09-18, when the last two NiceGUI screens (the pre-boot licence error and
+# activation pages) were ported to plain server-rendered HTML and the framework
+# was removed from this project entirely.
+#
+# ONE CONSEQUENCE, on the admin machine only: the KeyGen licence console
+# (~/Documents/KeyGen/forex_admin.py) is a separate NiceGUI tool that lives
+# OUTSIDE this repository, and backend/src/app.py imports it to offer the Admin
+# button. It fails that import cleanly and the trading app starts either way —
+# the button simply does not appear. If you want the console back on that
+# machine, `pip install nicegui` there, or port it; it is not a dependency of
+# this app.
+fastapi>=0.115.0
+uvicorn>=0.30.0
+itsdangerous>=2.2.0
+httpx>=0.27.0
+pydantic>=2.0.0
+anthropic>=0.36.0
+telethon>=1.36.0
+cryptg>=0.4.0
+PyYAML>=6.0
+scikit-learn>=1.3.0
+numpy>=1.26.0
+joblib>=1.3.0
+lightgbm>=4.0.0
+yfinance>=0.2.40
+# Windows only: MetaTrader5 Python package connects natively to the MT5 terminal.
+# On macOS the bridge runs under Wine and this package is installed there instead.
+MetaTrader5>=5.0.45; sys_platform == "win32"
+keyring
+websockets>=13.0
+cryptography>=42.0
+python-dateutil>=2.9.0
+psutil>=6.0.0
+matplotlib>=3.8.0

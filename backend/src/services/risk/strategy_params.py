@@ -1,0 +1,332 @@
+"""Live-tunable per-strategy point/multiplier parameters -- lets Conservative,
+Scalp Runner, Reversal Runner, Adaptive Runner, Adaptive Runner 2, Limit
+Runner, Conservative Trial, Signal Climber, Protected Scale, Scale Out, and
+BE Runner's fixed SL/TP/close-% constants be edited from Trading > Strategy
+without a code change or restart, plus a small named-template library to
+save/reapply parameter sets.
+
+Inspired by a third-party EA's "Settings Templates" panel (2026-07-22
+investigation) -- Python-only by design, no MQL5 involved (Limit Runner's own
+EA-side pending-order fields are sent fresh on every placement from whatever
+this module currently holds, so a tuning change here still needs no EA
+rebuild): every strategy covered here is already fully resolved to concrete
+SL/TP price levels/positions by Python before the EA (if any) ever sees the
+trade, so there's no EA-side constant to retune to get the same "no
+recompile" effect.
+
+Scope: SL-shaping constants only (a strategy's fixed point distance, or its
+widen/cap/floor multipliers) -- not the TP-ladder close-percentage tables
+(_CLIMBER_PCTS/_GDVR_PCTS in core_open_trade.py), which are shared across
+several strategies and shaped as an 8-TP-count lookup table rather than a
+single tunable value; retuning those is a materially bigger, separate task.
+
+Live values (strategy_params_snapshot()) sync between Local/Remote nodes
+the same way Trading Schedule does -- one combined snapshot proposed/
+confirmed together, not a per-strategy message (see backend.src.services.cluster.sync).
+The named-template library (strategy_param_templates table) stays
+node-local -- each node keeps its own saved presets.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+
+from backend.src.db import database as db_module
+from backend.src.services.risk import repo as risk_repo
+from backend.src.db.database import _schedule_coro
+from backend.src.utils.models import (
+    STRATEGY_CONSERVATIVE, STRATEGY_SCALP_RUNNER, STRATEGY_REVERSAL_RUNNER,
+    STRATEGY_ADAPTIVE_RUNNER, STRATEGY_ADAPTIVE_RUNNER_2, STRATEGY_LIMIT_RUNNER,
+    STRATEGY_CONSERVATIVE_TRIAL, STRATEGY_SIGNAL_CLIMBER, STRATEGY_PROTECTED_SCALE,
+    STRATEGY_SCALE_OUT, STRATEGY_BE_RUNNER, STRATEGY_FIXED_RR,
+)
+
+log = logging.getLogger(__name__)
+
+# (param_key, label, default, unit) -- unit is display-only ("pt"/"x"/"frac").
+PARAM_SPECS: dict[str, list[tuple[str, str, float, str]]] = {
+    STRATEGY_CONSERVATIVE: [
+        ("sl_pt",  "Stop Loss", 5.0, "pt"),
+        ("tp1_pt", "TP1",       3.0, "pt"),
+    ],
+    STRATEGY_SCALP_RUNNER: [
+        ("sl_pt",  "Stop Loss", 10.0, "pt"),
+        ("tp1_pt", "TP1",       3.0,  "pt"),
+        ("tp2_pt", "TP2",       4.0,  "pt"),
+    ],
+    STRATEGY_REVERSAL_RUNNER: [
+        ("sl_mult",     "SL widen multiplier", 4.0,  "x"),
+        ("sl_cap_pt",   "SL widen cap",        20.0, "pt"),
+        ("sl_floor_pt", "SL floor (bad data)", 8.0,  "pt"),
+    ],
+    STRATEGY_ADAPTIVE_RUNNER: [
+        ("sl_mult",     "SL widen multiplier",   4.0,  "x"),
+        ("sl_cap_pt",   "SL widen cap",          20.0, "pt"),
+        ("sl_floor_pt", "SL floor (bad data)",   8.0,  "pt"),
+        ("tp_cap_frac", "Final-TP distance cap", 0.50, "frac"),
+    ],
+    STRATEGY_ADAPTIVE_RUNNER_2: [
+        ("sl_pt", "Stop Loss (fixed)", 10.0, "pt"),
+    ],
+    # Limit Runner has no SL-shaping constant here -- its SL comes straight
+    # from the signal's own "SL <price>" line, unmodified (see
+    # core_limit_order_signal.py). be_at_pos is 1-based ("1" = TP1, "2" =
+    # TP2, ...) -- converted to run_tp_ladder's 0-indexed compacted position
+    # (value - 1) at the one call site that reads it
+    # (core_run_tp_ladder.handle_limit_runner). runner_reserve_pct is only
+    # meaningful when the signal contains a literal "TP OPEN" line -- the
+    # fraction of the position left permanently open (no fixed target,
+    # trailing SL only) once every numeric TP has closed its share; ignored
+    # (100% split across the numeric TPs, last one closes all remaining)
+    # when the signal has no "TP OPEN" line.
+    STRATEGY_LIMIT_RUNNER: [
+        ("be_at_pos",          "Breakeven at TP#",       1.0,  "tp#"),
+        ("runner_reserve_pct", "Runner reserve (TP OPEN)", 25.0, "%"),
+    ],
+    # Conservative Trial recomputes SL and all 6 TPs from the actual fill
+    # price at open time (core_open_trade_from_signal.py) -- sl_risk_usd
+    # drives the SL distance formula (pts = sl_risk_usd / (lot_size * 100)),
+    # the six tpN_pt values are the fixed point offsets from fill, and the
+    # tpN_pct values are the fraction of the original lot closed at each
+    # (TP6 always closes whatever remains, so it has no _pct entry).
+    STRATEGY_CONSERVATIVE_TRIAL: [
+        ("sl_risk_usd", "Stop Loss ($ risk target)", 100.0, "usd"),
+        ("tp1_pt",  "TP1",           5.0,  "pt"),
+        ("tp1_pct", "TP1 Close %",   5.0,  "%"),
+        ("tp2_pt",  "TP2",           10.0, "pt"),
+        ("tp2_pct", "TP2 Close %",   30.0, "%"),
+        ("tp3_pt",  "TP3",           14.0, "pt"),
+        ("tp3_pct", "TP3 Close %",   20.0, "%"),
+        ("tp4_pt",  "TP4",           20.0, "pt"),
+        ("tp4_pct", "TP4 Close %",   40.0, "%"),
+        ("tp5_pt",  "TP5",           27.0, "pt"),
+        ("tp5_pct", "TP5 Close %",   5.0,  "%"),
+        ("tp6_pt",  "TP6 (closes all remaining)", 35.0, "pt"),
+    ],
+    # Signal Climber rides the signal's own TP ladder (no fixed point
+    # offsets of its own) -- its exit fractions come from the shared
+    # _CLIMBER_PCTS table (core_open_trade.py), out of scope here for the
+    # same reason Reversal/Adaptive Runner's shared GDVR table is (see
+    # module docstring). be_at_pos is its one strategy-specific scalar,
+    # same 1-based "TP#" convention as Limit Runner.
+    STRATEGY_SIGNAL_CLIMBER: [
+        ("be_at_pos", "Breakeven at TP#", 1.0, "tp#"),
+    ],
+    # Fixed R:R -- a single stop and a single target, both real broker
+    # orders, with no breakeven move by design. Defaults come from
+    # tools/exit_policy_lab.py's sweep over measured trade paths (s4/t6
+    # scored +0.418R with a bootstrap CI entirely above zero); they are
+    # exposed here so the lab can be re-run and the winner re-applied
+    # without a code change.
+    STRATEGY_FIXED_RR: [
+        ("sl_pt", "Stop Loss", 4.0, "pt"),
+        ("tp_pt", "Take Profit", 6.0, "pt"),
+    ],
+    # Protected Scale skips TP1 (insurance only), moves SL to BE at TP2,
+    # then closes this same percentage at each of TP3/TP4/TP5.
+    STRATEGY_PROTECTED_SCALE: [
+        ("mid_tp_close_pct", "TP3-TP5 Close %", 20.0, "%"),
+    ],
+    # Scale Out: tiered close schedule, taper toward the back; whatever TP
+    # is last-defined on the signal always closes all remaining lots
+    # regardless of these percentages.
+    STRATEGY_SCALE_OUT: [
+        ("tp1_pct", "TP1 Close %", 40.0, "%"),
+        ("tp2_pct", "TP2 Close %", 30.0, "%"),
+        ("tp3_pct", "TP3 Close %", 20.0, "%"),
+        ("tp4_pct", "TP4 Close %", 10.0, "%"),
+    ],
+    # BE Runner has no fixed point/percentage constant of its own -- it
+    # steps SL through the signal's own TP ladder with no partial closes.
+    # Its only tunable number is the ADX threshold gating the ranging-market
+    # fallback to Scale Out.
+    STRATEGY_BE_RUNNER: [
+        ("adx_ranging_threshold", "ADX ranging threshold", 25.0, "adx"),
+    ],
+}
+
+STRATEGY_LABELS: dict[str, str] = {
+    STRATEGY_CONSERVATIVE:      "Conservative",
+    STRATEGY_SCALP_RUNNER:      "Scalp Runner",
+    STRATEGY_REVERSAL_RUNNER:     "Reversal Runner",
+    STRATEGY_ADAPTIVE_RUNNER:   "Adaptive Runner",
+    STRATEGY_ADAPTIVE_RUNNER_2: "Adaptive Runner 2",
+    STRATEGY_LIMIT_RUNNER:      "Limit Runner",
+    STRATEGY_CONSERVATIVE_TRIAL: "Conservative Trial",
+    STRATEGY_SIGNAL_CLIMBER:     "Signal Climber",
+    STRATEGY_PROTECTED_SCALE:    "Protected Scale",
+    STRATEGY_SCALE_OUT:          "Scale Out",
+    STRATEGY_BE_RUNNER:          "BE Runner",
+}
+
+# Strategies in display order for the UI's strategy picker.
+PARAM_STRATEGIES: list[str] = [
+    STRATEGY_CONSERVATIVE, STRATEGY_SCALP_RUNNER, STRATEGY_CONSERVATIVE_TRIAL,
+    STRATEGY_SIGNAL_CLIMBER, STRATEGY_PROTECTED_SCALE, STRATEGY_SCALE_OUT,
+    STRATEGY_BE_RUNNER, STRATEGY_REVERSAL_RUNNER, STRATEGY_ADAPTIVE_RUNNER,
+    STRATEGY_ADAPTIVE_RUNNER_2, STRATEGY_LIMIT_RUNNER, STRATEGY_FIXED_RR,
+]
+
+_DEFAULTS: dict[str, dict[str, float]] = {
+    strategy: {key: default for key, _label, default, _unit in specs}
+    for strategy, specs in PARAM_SPECS.items()
+}
+
+_CACHE_TTL = 10.0  # seconds -- these change only on user edit
+_cache: dict[str, tuple[dict, float]] = {}
+
+# Keyed on strategy and time, not on which database is open, so without this a
+# demo/live switch would keep serving the other environment's parameters for up
+# to _CACHE_TTL. Same defect as get_risk_settings() had; see database.init().
+db_module.register_cache_invalidator(_cache.clear)
+
+
+def default_params(strategy: str) -> dict[str, float]:
+    return dict(_DEFAULTS.get(strategy, {}))
+
+
+def get_strategy_params(strategy: str) -> dict[str, float]:
+    """Live values for `strategy` -- DB override merged over the built-in
+    defaults, so a param never silently disappears if get_app_config()
+    fails, or a previously-saved override predates a newly-added param."""
+    now = time.time()
+    cached = _cache.get(strategy)
+    if cached is not None and (now - cached[1]) < _CACHE_TTL:
+        return cached[0]
+    values = default_params(strategy)
+    raw = db_module.get_app_config(f"strategy_params_{strategy}")
+    if raw:
+        try:
+            override = json.loads(raw)
+            values.update({k: float(v) for k, v in override.items() if k in values})
+        except Exception as exc:
+            log.debug("[StrategyParams] bad override for %s: %s", strategy, exc)
+    _cache[strategy] = (values, now)
+    return values
+
+
+_applying_sync_strategy_params = False  # re-entrancy guard -- see update_risk_settings
+
+
+def set_strategy_params(strategy: str, params: dict, _from_sync: bool = False) -> dict:
+    """Overwrite the live values for `strategy`. Unknown keys in `params`
+    are silently dropped rather than stored -- a typo'd key would
+    otherwise be saved but never actually read by anything.
+
+    _from_sync=True is used only when APPLYING a value that arrived over
+    the Local/Remote sync channel -- without this guard, applying an
+    incoming sync value would immediately re-forward it back out, an
+    infinite propose/confirm ping-pong between the two nodes (same
+    pattern as core_db_risk_settings.update_risk_settings)."""
+    global _applying_sync_strategy_params
+    if strategy not in _DEFAULTS:
+        raise ValueError(f"Unknown strategy: {strategy}")
+    valid_keys = set(_DEFAULTS[strategy])
+    merged = default_params(strategy)
+    merged.update({k: float(v) for k, v in params.items() if k in valid_keys})
+    db_module.set_app_config(f"strategy_params_{strategy}", json.dumps(merged))
+    _cache.pop(strategy, None)
+
+    if not _from_sync and not _applying_sync_strategy_params:
+        _applying_sync_strategy_params = True
+        try:
+            _forward_strategy_params_over_sync()
+        finally:
+            _applying_sync_strategy_params = False
+    return merged
+
+
+def _forward_strategy_params_over_sync() -> None:
+    """Send the FULL current snapshot (all 5 strategies) to the paired
+    node, whichever role this process has. Sends the whole snapshot, not
+    just the one strategy that changed -- same one-combined-message shape
+    as Trading Schedule, avoiding a race between two near-simultaneous
+    edits to different strategies. No-op (and near-zero cost) if sync
+    isn't configured."""
+    # The VPS end first: see cluster/sync/role.py for why.
+    try:
+        from backend.src.services.cluster.sync.role import listening_server
+        srv = listening_server()
+        if srv is not None:
+            _schedule_coro(srv.broadcast_strategy_params())
+            return
+    except Exception as exc:
+        log.debug("[Sync] strategy params forward (server) failed: %s", exc)
+
+    try:
+        from backend.src.services.cluster.sync import client as _sync_cli_mod
+        cli = _sync_cli_mod.get_instance()
+        if cli is not None:
+            _schedule_coro(cli.propose_strategy_params(strategy_params_snapshot()))
+            return
+    except Exception as exc:
+        log.debug("[Sync] strategy params forward (client) failed: %s", exc)
+
+
+def reset_strategy_params(strategy: str) -> dict:
+    """Delete the live override -- reverts to built-in defaults."""
+    if strategy not in _DEFAULTS:
+        raise ValueError(f"Unknown strategy: {strategy}")
+    return set_strategy_params(strategy, default_params(strategy))
+
+
+def strategy_params_snapshot() -> dict:
+    """Full {strategy: {param: value}} snapshot for every param-based
+    strategy -- used by Local/Remote sync (mirrors core_trading_schedule's
+    trading_schedule_snapshot())."""
+    return {strategy: get_strategy_params(strategy) for strategy in PARAM_STRATEGIES}
+
+
+def apply_strategy_params_snapshot(snapshot: dict) -> None:
+    """Apply an incoming sync snapshot -- one set_strategy_params() call
+    per known strategy present in the snapshot; unknown strategy keys are
+    silently skipped (forward-compat if a future version adds a strategy
+    this node doesn't know about yet)."""
+    for strategy, params in (snapshot or {}).items():
+        if strategy in _DEFAULTS:
+            set_strategy_params(strategy, params or {}, _from_sync=True)
+
+
+# ── Named template library ───────────────────────────────────────────────────
+
+def list_templates(strategy: str) -> list[dict]:
+    rows = risk_repo.list_param_templates(strategy)
+    out = []
+    for r in rows:
+        d = db_module.row_to_dict(r)
+        try:
+            d["params"] = json.loads(d.pop("params_json"))
+        except Exception:
+            d["params"] = {}
+        out.append(d)
+    return out
+
+
+def save_template(strategy: str, name: str, params: dict) -> int:
+    if strategy not in _DEFAULTS:
+        raise ValueError(f"Unknown strategy: {strategy}")
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("Template name is required")
+    valid_keys = set(_DEFAULTS[strategy])
+    clean = {k: float(v) for k, v in params.items() if k in valid_keys}
+    return risk_repo.insert_param_template(
+        strategy, name, json.dumps(clean), time.time())
+
+
+def delete_template(template_id: int) -> None:
+    risk_repo.delete_param_template(template_id)
+
+
+def apply_template(template_id: int) -> dict:
+    """Load a saved template and make it the strategy's live values."""
+    row = risk_repo.get_param_template(template_id)
+    if not row:
+        raise ValueError(f"Template {template_id} not found")
+    strategy, params_json = row[0], row[1]
+    try:
+        params = json.loads(params_json)
+    except Exception:
+        params = {}
+    return set_strategy_params(strategy, params)

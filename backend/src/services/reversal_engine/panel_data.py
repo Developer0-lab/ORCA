@@ -1,0 +1,184 @@
+"""Panel reads for the Reversal Engine signal-generator page.
+
+Every function here is one named operation the panel performs, dispatched off
+the event loop. This module exists to kill `run_db(fn)` -- a controller hatch
+that took an arbitrary callable from the page and ran it on the DB worker
+thread. That inverted the layering: the *page* chose the data access and the
+controller only supplied a thread. It also meant every panel imported this
+engine's repo directly to have something to hand over.
+
+The local/remote facade is built here rather than in the page. In Remote mode
+(the VPS is the active trader) these transparently read the mirrored remote
+signal-gen stats instead of this node's own local data -- see
+`cluster/sync/remote_stats_facade.py`. The page cannot tell the difference,
+which is the point.
+"""
+from __future__ import annotations
+
+from backend.src.db.database import to_db_thread
+from backend.src.services.cluster.sync.remote_stats_facade import make_facades
+from backend.src.services.reversal_engine import ml_engine as _real_ml
+from backend.src.services.reversal_engine import reversal_engine_repo as _real_db
+from backend.src.db import database as _core_db
+
+_db, _ml, _ = make_facades("reversal_engine", _real_db, _real_ml)
+
+__all__ = ["virtual_balance", "max_drawdown", "stats", "active_levels", "open_signals", "all_signals", "perf_by_session", "perf_by_bias", "perf_by_level_type", "analysis_log", "ml_summary", "ml_metrics", "ml_thresholds", "chance_benchmark", "cross_asset_report"]
+
+async def virtual_balance():
+    return await to_db_thread(_db.get_virtual_balance)
+
+async def max_drawdown():
+    return await to_db_thread(_db.get_max_drawdown)
+
+async def stats():
+    return await to_db_thread(_db.get_stats)
+
+async def active_levels():
+    return await to_db_thread(_db.get_active_levels)
+
+async def open_signals():
+    return await to_db_thread(_db.get_open_signals)
+
+async def all_signals(limit: int = 80):
+    return await to_db_thread(_db.get_all_signals, limit=limit)
+
+async def perf_by_session():
+    return await to_db_thread(_db.get_perf_by_session)
+
+async def perf_by_bias():
+    return await to_db_thread(_db.get_perf_by_bias)
+
+async def perf_by_level_type():
+    return await to_db_thread(_db.get_perf_by_level_type)
+
+async def analysis_log(limit: int = 30):
+    return await to_db_thread(_db.get_analysis_log, limit=limit)
+
+async def ml_summary():
+    return await to_db_thread(_ml.summary)
+
+async def ml_metrics():
+    return await to_db_thread(_ml.get_ml_metrics)
+
+
+# -- ML constants -------------------------------------------------------------
+
+def ml_thresholds() -> dict:
+    """MIN_TRAIN_SAMPLES / RETRAIN_EVERY, which the panel renders as prose."""
+    return {"min_train_samples": _ml.MIN_TRAIN_SAMPLES,
+            "retrain_every": _ml.RETRAIN_EVERY}
+
+
+async def get_realised_pnl() -> dict:
+    """What this engine's trades actually made, from the core trade ledger.
+
+    Async and offloaded like every other accessor in this module: the
+    controller layer must not import the database (a contract enforced at
+    zero), so the thread hop belongs here rather than at the call site.
+
+    Deliberately not read from reversal_engine.db: that database records
+    every signal the generator produced and prices them all at the virtual
+    lot, whether or not the trade was ever placed. Only rows here in
+    vantage_simulated_trades correspond to orders that really went to MT5.
+    """
+    from backend.src.services.analytics import read_repo as _reads
+    from backend.src.services.reversal_engine.stats_repo import stats_epoch
+    since = await to_db_thread(stats_epoch)
+    return await to_db_thread(_reads.realised_pnl_for_source,
+                              "Reversal Engine", since)
+
+
+async def get_edge_stats() -> dict:
+    """Profit factor and expectancy for this engine's REAL trades.
+
+    Same source as `get_realised_pnl` and the same reset epoch, deliberately:
+    two figures on one screen computed over different rows is worse than
+    either being absent. The engine's own database prices every signal it
+    produced at the virtual lot whether or not the order was placed, so it
+    cannot answer this.
+    """
+    from backend.src.services.analytics import read_repo as _reads
+    from backend.src.services.reversal_engine.stats_repo import stats_epoch
+    since = await to_db_thread(stats_epoch)
+    return await to_db_thread(_reads.edge_for_source, "Reversal Engine", since)
+
+
+async def reset_stats() -> float:
+    """Start this panel's numbers again from now. Returns the new epoch.
+
+    Reporting only: no signal row, stored feature vector, reconstructed
+    excursion or attribution history is removed. See
+    `stats_repo.reset_stats` for why that distinction is load-bearing.
+
+    Offloaded like every other accessor here -- the controller layer must
+    not import a repo, a contract enforced at zero, so the hop belongs on
+    this side of the boundary.
+    """
+    from backend.src.services.reversal_engine.stats_repo import reset_stats as _reset
+    return await to_db_thread(_reset)
+
+
+
+# -- Does it beat chance? (docs/todo/reversal-engine/220) ----------------------
+
+# The report polls every 30s; the answer moves by one trade at a time. Five
+# minutes of staleness costs nothing a reader could act on.
+_BENCH_TTL_S = 300.0
+_bench_cache: tuple[float, dict] = (0.0, {})
+
+
+async def chance_benchmark() -> dict:
+    """Win rate against the no-edge rate SL/(SL+TP), by group.
+
+    Local rows only, deliberately not through the remote facade: the mirror
+    carries summary stats, not the per-signal rows this needs.
+    """
+    import time as _time
+    global _bench_cache
+    now = _time.time()
+    ts, cached = _bench_cache
+    if cached and now - ts < _BENCH_TTL_S:
+        return cached
+    from backend.src.services.reversal_engine import chance_benchmark as _cb
+    from backend.src.services.reversal_engine import stats_repo as _stats
+
+    def _compute() -> dict:
+        return _cb.benchmark(_stats.benchmark_rows(), now=now)
+
+    report = await to_db_thread(_compute)
+    _bench_cache = (now, report)
+    return report
+
+
+# -- Cross-asset context (docs/todo/reversal-engine/230) ----------------------
+
+_xa_cache: tuple[float, dict] = (0.0, {})
+
+
+async def cross_asset_report() -> dict:
+    """What the chart draws: each peer's daily correlation with gold, and the
+    meta-labeller's out-of-sample AUC with and without the peers at every
+    refit. Same five-minute cache and local-only reasoning as the benchmark."""
+    import time as _time
+    global _xa_cache
+    now = _time.time()
+    ts, cached = _xa_cache
+    if cached and now - ts < _BENCH_TTL_S:
+        return cached
+    from backend.src.services.reversal_engine import cross_asset as _xa
+    from backend.src.services.reversal_engine import xasset_repo as _xr
+
+    def _compute() -> dict:
+        records = _xr.stored_records()
+        return {
+            "peers": list(_xa.PEERS),
+            "coverage": {"measured": len(records),
+                         "missing": len(_xr.signals_missing_xasset())},
+            "daily_corr": _xa.daily_correlation(records),
+            "fits": _xr.fit_history(),
+        }
+
+    report = await to_db_thread(_compute)
+    _xa_cache = (now, report)
+    return report

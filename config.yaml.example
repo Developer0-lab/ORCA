@@ -1,0 +1,61 @@
+# FOREX Trader — Configuration Template
+#
+# FIRST-TIME SETUP:
+#   1. Copy this file to:
+#        ~/Library/Application Support/ForexTrader/config.yaml
+#   2. Fill in your own values below.
+#
+# This file (config.yaml.example) ships with the app and contains no credentials.
+# Your config.yaml lives outside the app folder and is never overwritten by updates.
+
+account_env: demo          # "demo" or "live"
+starting_balance: 1000.0   # starting simulation balance in USD
+
+# ── MT5 Bridge ────────────────────────────────────────────────────────────────
+mt5_bridge_enabled: true
+mt5_bridge_url: http://localhost:9000
+mt5_login: 0              # your MT5 account number
+mt5_server: ''            # e.g. VantageMarkets-Demo
+
+# ── Wine / CrossOver paths (macOS only) ───────────────────────────────────────
+# Leave as-is if you installed CrossOver in the default location.
+wine_bin: /Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine
+mt5_bottle_path: ~/Library/Application Support/CrossOver/Bottles/MetaTrader 5
+
+# ── Claude AI ─────────────────────────────────────────────────────────────────
+anthropic_api_key: ''
+claude_model: claude-haiku-4-5
+
+# ── Telegram reader (Telethon) ────────────────────────────────────────────────
+telegram_api_id: ''
+telegram_api_hash: ''
+telegram_phone: ''         # international format e.g. +447911123456
+telegram_2fa_password: ''
+telegram_session_name: forex_trader
+telegram_signal_group_id: ''
+
+# ── Telegram bot alerts ───────────────────────────────────────────────────────
+telegram_bot_token: ''
+telegram_chat_id: ''
+
+# ── Economic news blackout ────────────────────────────────────────────────────
+# Suppresses new entries from the Signal Generator and Breakout engines around
+# calendar events. Editable in-app on the News tab. Events come from the
+# ForexFactory weekly feed — no API key needed.
+news_blackout_enabled: true
+news_blackout_impact: high        # "high" or "high_medium"
+news_blackout_minutes_before: 30
+news_blackout_minutes_after: 30
+
+# ── App ───────────────────────────────────────────────────────────────────────
+port: 8888
+# Debug mode runs the whole app on fakes — no MT5 terminal, no Telegram, no
+# credentials, no network — for local development. It uses its own database
+# (forex_trader_debug.db) and never touches the demo/live files. Off by default;
+# the env var FOREX_DEBUG_MODE=1 overrides this. (See docs/todo/refactor/infra/local-debug-mode.)
+debug_mode: false
+# Dashboard bind address. Defaults to 127.0.0.1 (this machine only) because the
+# UI has no login and can place/close live orders. Do NOT change to 0.0.0.0 or a
+# LAN IP unless real authentication is in front of it — the app logs a warning
+# every launch if this is non-loopback.
+host: 127.0.0.1
